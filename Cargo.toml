@@ -1,0 +1,13 @@
+[package]
+name = "mini-rsllm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+memmap2 = "0.9"       # Memory-mapped file I/O for loading large model files
+byteorder = "1.5"     # Reading binary data (little-endian integers, floats)
+half = "2.4"          # f16 support for dequantizing half-precision weights
+
+[profile.release]
+opt-level = 3
+lto = true
