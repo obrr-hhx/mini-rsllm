@@ -1,7 +1,8 @@
 // LLaMA model: load config/weights from GGUF, forward pass with GQA attention.
 
+use crate::backend::{Backend, CpuBackend};
 use crate::gguf::GgufFile;
-use crate::tensor::{self, TensorRef, matmul_vec, rms_norm, rope, silu, add, mul, dequantize};
+use crate::tensor::{dequantize, TensorRef};
 
 /// LLaMA model configuration, read from GGUF metadata.
 pub struct LlamaConfig {
@@ -19,20 +20,24 @@ pub struct LlamaConfig {
 
 impl LlamaConfig {
     pub fn from_gguf(gguf: &GgufFile) -> Self {
-        let dim = gguf.get_u32("llama.embedding_length").unwrap_or(
-            gguf.get_u32("gpt2.embedding_length").unwrap_or(512),
-        ) as usize;
-        let n_layers = gguf.get_u32("llama.block_count").unwrap_or(
-            gguf.get_u32("gpt2.block_count").unwrap_or(4),
-        ) as usize;
-        let n_heads = gguf.get_u32("llama.attention.head_count").unwrap_or(
-            gguf.get_u32("gpt2.attention.head_count").unwrap_or(8),
-        ) as usize;
+        let dim = gguf
+            .get_u32("llama.embedding_length")
+            .unwrap_or(gguf.get_u32("gpt2.embedding_length").unwrap_or(512))
+            as usize;
+        let n_layers =
+            gguf.get_u32("llama.block_count")
+                .unwrap_or(gguf.get_u32("gpt2.block_count").unwrap_or(4)) as usize;
+        let n_heads = gguf
+            .get_u32("llama.attention.head_count")
+            .unwrap_or(gguf.get_u32("gpt2.attention.head_count").unwrap_or(8))
+            as usize;
         let n_kv_heads = gguf.get_u32("llama.attention.head_count_kv").unwrap_or(
-            gguf.get_u32("gpt2.attention.head_count_kv").unwrap_or(n_heads as u32),
+            gguf.get_u32("gpt2.attention.head_count_kv")
+                .unwrap_or(n_heads as u32),
         ) as usize;
         let ff_dim = gguf.get_u32("llama.feed_forward_length").unwrap_or(
-            gguf.get_u32("gpt2.feed_forward_length").unwrap_or((dim * 4) as u32),
+            gguf.get_u32("gpt2.feed_forward_length")
+                .unwrap_or((dim * 4) as u32),
         ) as usize;
 
         let vocab_size = gguf
@@ -166,10 +171,15 @@ pub struct LlamaModel<'a> {
     pub config: LlamaConfig,
     pub weights: LlamaWeights<'a>,
     pub kv_cache: KvCache,
+    backend: Box<dyn Backend>,
 }
 
 impl<'a> LlamaModel<'a> {
     pub fn from_gguf(gguf: &'a GgufFile) -> Self {
+        Self::from_gguf_with_backend(gguf, Box::new(CpuBackend::new()))
+    }
+
+    pub fn from_gguf_with_backend(gguf: &'a GgufFile, backend: Box<dyn Backend>) -> Self {
         let config = LlamaConfig::from_gguf(gguf);
         let weights = LlamaWeights::from_gguf(gguf, &config);
         let kv_dim = config.n_kv_heads * config.head_dim;
@@ -179,17 +189,36 @@ impl<'a> LlamaModel<'a> {
             config,
             weights,
             kv_cache,
+            backend,
         }
+    }
+
+    pub fn backend_name(&self) -> &'static str {
+        self.backend.name()
     }
 
     /// Forward pass for a single token at a given position.
     /// Returns logits vector of shape [vocab_size].
-    pub fn forward(&mut self, token_id: u32, pos: usize) -> Vec<f32> {
+    pub fn forward(&mut self, token_id: u32, pos: usize) -> Result<Vec<f32>, String> {
         let cfg = &self.config;
         let w = &self.weights;
         let head_dim = cfg.head_dim;
         let kv_dim = cfg.n_kv_heads * head_dim;
         let n_heads_per_kv = cfg.n_heads / cfg.n_kv_heads;
+
+        if pos >= cfg.max_seq_len {
+            return Err(format!(
+                "position {} exceeds context length {}",
+                pos, cfg.max_seq_len
+            ));
+        }
+        if token_id as usize >= w.token_embd.rows() {
+            return Err(format!(
+                "token id {} out of embedding range {}",
+                token_id,
+                w.token_embd.rows()
+            ));
+        }
 
         // 1. Embedding lookup: x = token_embd[token_id] → [dim]
         let embd_row = w.token_embd.dequantize_row(token_id as usize);
@@ -207,22 +236,21 @@ impl<'a> LlamaModel<'a> {
             );
 
             // 2a. Attention norm
-            let h = rms_norm(&x, &attn_norm_w, cfg.norm_eps);
+            let h = self.backend.rms_norm(&x, &attn_norm_w, cfg.norm_eps);
 
             // 2b. Q, K, V projections
-            let mut q = matmul_vec(&layer.wq, &h);
-            let mut k = matmul_vec(&layer.wk, &h);
-            let v = matmul_vec(&layer.wv, &h);
+            let mut q = self.backend.matmul_vec(&layer.wq, &h);
+            let mut k = self.backend.matmul_vec(&layer.wk, &h);
+            let v = self.backend.matmul_vec(&layer.wv, &h);
 
             // 2c. Apply RoPE
-            rope(&mut q, &mut k, pos, head_dim, cfg.rope_freq_base);
+            self.backend
+                .rope(&mut q, &mut k, pos, head_dim, cfg.rope_freq_base);
 
             // 2d. Store K, V into cache
             let kv_offset = pos * kv_dim;
-            self.kv_cache.key_cache[layer_idx][kv_offset..kv_offset + kv_dim]
-                .copy_from_slice(&k);
-            self.kv_cache.val_cache[layer_idx][kv_offset..kv_offset + kv_dim]
-                .copy_from_slice(&v);
+            self.kv_cache.key_cache[layer_idx][kv_offset..kv_offset + kv_dim].copy_from_slice(&k);
+            self.kv_cache.val_cache[layer_idx][kv_offset..kv_offset + kv_dim].copy_from_slice(&v);
 
             // 2e. Multi-head attention with GQA
             let mut attn_out = vec![0.0f32; cfg.dim];
@@ -241,14 +269,13 @@ impl<'a> LlamaModel<'a> {
                     let k_base = t * kv_dim + kv_head_offset;
                     let mut dot = 0.0f32;
                     for d in 0..head_dim {
-                        dot += q[q_offset + d]
-                            * self.kv_cache.key_cache[layer_idx][k_base + d];
+                        dot += q[q_offset + d] * self.kv_cache.key_cache[layer_idx][k_base + d];
                     }
                     scores.push(dot * scale);
                 }
 
                 // Softmax over scores
-                tensor::softmax(&mut scores);
+                self.backend.softmax(&mut scores);
 
                 // Weighted sum of values: attn_out_head = scores @ V_cached[:pos+1]
                 for t in 0..seq_len {
@@ -262,8 +289,8 @@ impl<'a> LlamaModel<'a> {
             }
 
             // 2f. Output projection + residual
-            let attn_proj = matmul_vec(&layer.wo, &attn_out);
-            x = add(&x, &attn_proj);
+            let attn_proj = self.backend.matmul_vec(&layer.wo, &attn_out);
+            x = self.backend.add(&x, &attn_proj);
 
             // 2g. FFN norm
             let ffn_norm_w = dequantize(
@@ -271,16 +298,16 @@ impl<'a> LlamaModel<'a> {
                 layer.ffn_norm.info.dtype,
                 layer.ffn_norm.info.n_elements(),
             );
-            let h = rms_norm(&x, &ffn_norm_w, cfg.norm_eps);
+            let h = self.backend.rms_norm(&x, &ffn_norm_w, cfg.norm_eps);
 
             // 2h. SwiGLU FFN: x = x + w2 @ (silu(w1 @ h) * (w3 @ h))
-            let gate = matmul_vec(&layer.w1, &h);
-            let up = matmul_vec(&layer.w3, &h);
-            let gate_act = silu(&gate);
-            let ffn_hidden = mul(&gate_act, &up);
-            let ffn_out = matmul_vec(&layer.w2, &ffn_hidden);
+            let gate = self.backend.matmul_vec(&layer.w1, &h);
+            let up = self.backend.matmul_vec(&layer.w3, &h);
+            let gate_act = self.backend.silu(&gate);
+            let ffn_hidden = self.backend.mul(&gate_act, &up);
+            let ffn_out = self.backend.matmul_vec(&layer.w2, &ffn_hidden);
 
-            x = add(&x, &ffn_out);
+            x = self.backend.add(&x, &ffn_out);
         }
 
         // 3. Final norm
@@ -289,10 +316,10 @@ impl<'a> LlamaModel<'a> {
             w.output_norm.info.dtype,
             w.output_norm.info.n_elements(),
         );
-        x = rms_norm(&x, &output_norm_w, cfg.norm_eps);
+        x = self.backend.rms_norm(&x, &output_norm_w, cfg.norm_eps);
 
         // 4. Output projection → logits [vocab_size]
-        let logits = matmul_vec(&w.output, &x);
-        logits
+        let logits = self.backend.matmul_vec(&w.output, &x);
+        Ok(logits)
     }
 }

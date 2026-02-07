@@ -42,7 +42,12 @@ pub fn dequantize(data: &[u8], dtype: GgufDType, n_elements: usize) -> Vec<f32> 
 fn dequantize_f32(data: &[u8], n: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
-        let bytes = [data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]];
+        let bytes = [
+            data[i * 4],
+            data[i * 4 + 1],
+            data[i * 4 + 2],
+            data[i * 4 + 3],
+        ];
         out.push(f32::from_le_bytes(bytes));
     }
     out
@@ -102,36 +107,38 @@ fn dequantize_q4_0(data: &[u8], n_elements: usize) -> Vec<f32> {
 fn dequantize_q6_k(data: &[u8], n_elements: usize) -> Vec<f32> {
     let n_blocks = n_elements / 256;
     let mut out = Vec::with_capacity(n_elements);
-        for block in 0..n_blocks {
-            let bo = block * 210;
-            let ql = &data[bo..bo + 128];
-            let qh = &data[bo + 128..bo + 192];
-            let scales = &data[bo + 192..bo + 208];
-            let d = f16::from_le_bytes([data[bo + 208], data[bo + 209]]).to_f32();
+    for block in 0..n_blocks {
+        let bo = block * 210;
+        let ql = &data[bo..bo + 128];
+        let qh = &data[bo + 128..bo + 192];
+        let scales = &data[bo + 192..bo + 208];
+        let d = f16::from_le_bytes([data[bo + 208], data[bo + 209]]).to_f32();
 
-            let mut block_out = [0.0f32; 256];
-            // Process two 128-value halves
-            for half in 0..2usize {
-                let ql_off = half * 64;
-                let qh_off = half * 32;
-                let sc_base = half * 8;
-                let y_off = half * 128;
+        let mut block_out = [0.0f32; 256];
+        // Process two 128-value halves
+        for half in 0..2usize {
+            let ql_off = half * 64;
+            let qh_off = half * 32;
+            let sc_base = half * 8;
+            let y_off = half * 128;
 
-                for l in 0..32 {
-                    let is = l / 16;
-                    let q1 = ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i32 - 32;
-                    let q2 = ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32 - 32;
-                    let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
-                    let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32 - 32;
+            for l in 0..32 {
+                let is = l / 16;
+                let q1 = ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i32 - 32;
+                let q2 =
+                    ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32 - 32;
+                let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
+                let q4 =
+                    ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32 - 32;
 
-                    let sc0 = scales[sc_base + is + 0] as i8 as f32;
-                    let sc2 = scales[sc_base + is + 2] as i8 as f32;
-                    let sc4 = scales[sc_base + is + 4] as i8 as f32;
-                    let sc6 = scales[sc_base + is + 6] as i8 as f32;
+                let sc0 = scales[sc_base + is + 0] as i8 as f32;
+                let sc2 = scales[sc_base + is + 2] as i8 as f32;
+                let sc4 = scales[sc_base + is + 4] as i8 as f32;
+                let sc6 = scales[sc_base + is + 6] as i8 as f32;
 
-                    block_out[y_off + l] = d * sc0 * q1 as f32;
-                    block_out[y_off + l + 32] = d * sc2 * q2 as f32;
-                    block_out[y_off + l + 64] = d * sc4 * q3 as f32;
+                block_out[y_off + l] = d * sc0 * q1 as f32;
+                block_out[y_off + l + 32] = d * sc2 * q2 as f32;
+                block_out[y_off + l + 64] = d * sc4 * q3 as f32;
                 block_out[y_off + l + 96] = d * sc6 * q4 as f32;
             }
         }
@@ -255,7 +262,7 @@ fn dot_product_quantized(row_data: &[u8], vec: &[f32], dtype: GgufDType, n: usiz
                     let byte = row_data[bo + 2 + i];
                     let lo = (byte & 0x0F) as i32 - 8;
                     let hi = ((byte >> 4) & 0x0F) as i32 - 8;
-                    block_sum += lo as f32 * vec[vi + i];      // positions 0-15
+                    block_sum += lo as f32 * vec[vi + i]; // positions 0-15
                     block_sum += hi as f32 * vec[vi + 16 + i]; // positions 16-31
                 }
                 sum += scale * block_sum;
@@ -281,10 +288,18 @@ fn dot_product_quantized(row_data: &[u8], vec: &[f32], dtype: GgufDType, n: usiz
 
                     for l in 0..32 {
                         let is = l / 16;
-                        let q1 = ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i32 - 32;
-                        let q2 = ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32 - 32;
-                        let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
-                        let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32 - 32;
+                        let q1 = ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4))
+                            as i32
+                            - 32;
+                        let q2 = ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4))
+                            as i32
+                            - 32;
+                        let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4))
+                            as i32
+                            - 32;
+                        let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4))
+                            as i32
+                            - 32;
 
                         let sc0 = scales[sc_base + is + 0] as i8 as f32;
                         let sc2 = scales[sc_base + is + 2] as i8 as f32;
@@ -335,9 +350,7 @@ pub fn softmax(x: &mut [f32]) {
 
 /// SiLU activation: x * sigmoid(x)
 pub fn silu(x: &[f32]) -> Vec<f32> {
-    x.iter()
-        .map(|&v| v * (1.0 / (1.0 + (-v).exp())))
-        .collect()
+    x.iter().map(|&v| v * (1.0 / (1.0 + (-v).exp()))).collect()
 }
 
 /// Apply Rotary Position Embedding to q and k vectors in-place.
