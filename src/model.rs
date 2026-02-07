@@ -172,6 +172,7 @@ pub struct LlamaModel<'a> {
     pub weights: LlamaWeights<'a>,
     pub kv_cache: KvCache,
     backend: Box<dyn Backend>,
+    cpu_backend: CpuBackend,
 }
 
 impl<'a> LlamaModel<'a> {
@@ -190,6 +191,7 @@ impl<'a> LlamaModel<'a> {
             weights,
             kv_cache,
             backend,
+            cpu_backend: CpuBackend::new(),
         }
     }
 
@@ -227,6 +229,7 @@ impl<'a> LlamaModel<'a> {
         // 2. Transformer layers
         for layer_idx in 0..cfg.n_layers {
             let layer = &w.layers[layer_idx];
+            let use_gpu = self.backend.should_use_layer_gpu(layer_idx, cfg.n_layers);
 
             // Dequantize norm weights (1D vectors)
             let attn_norm_w = dequantize(
@@ -236,16 +239,37 @@ impl<'a> LlamaModel<'a> {
             );
 
             // 2a. Attention norm
-            let h = self.backend.rms_norm(&x, &attn_norm_w, cfg.norm_eps);
+            let h = if use_gpu {
+                self.backend.rms_norm(&x, &attn_norm_w, cfg.norm_eps)
+            } else {
+                self.cpu_backend.rms_norm(&x, &attn_norm_w, cfg.norm_eps)
+            };
 
             // 2b. Q, K, V projections
-            let mut q = self.backend.matmul_vec(&layer.wq, &h);
-            let mut k = self.backend.matmul_vec(&layer.wk, &h);
-            let v = self.backend.matmul_vec(&layer.wv, &h);
+            let mut q = if use_gpu {
+                self.backend.matmul_vec(&layer.wq, &h)
+            } else {
+                self.cpu_backend.matmul_vec(&layer.wq, &h)
+            };
+            let mut k = if use_gpu {
+                self.backend.matmul_vec(&layer.wk, &h)
+            } else {
+                self.cpu_backend.matmul_vec(&layer.wk, &h)
+            };
+            let v = if use_gpu {
+                self.backend.matmul_vec(&layer.wv, &h)
+            } else {
+                self.cpu_backend.matmul_vec(&layer.wv, &h)
+            };
 
             // 2c. Apply RoPE
-            self.backend
-                .rope(&mut q, &mut k, pos, head_dim, cfg.rope_freq_base);
+            if use_gpu {
+                self.backend
+                    .rope(&mut q, &mut k, pos, head_dim, cfg.rope_freq_base);
+            } else {
+                self.cpu_backend
+                    .rope(&mut q, &mut k, pos, head_dim, cfg.rope_freq_base);
+            }
 
             // 2d. Store K, V into cache
             let kv_offset = pos * kv_dim;
@@ -275,7 +299,11 @@ impl<'a> LlamaModel<'a> {
                 }
 
                 // Softmax over scores
-                self.backend.softmax(&mut scores);
+                if use_gpu {
+                    self.backend.softmax(&mut scores);
+                } else {
+                    self.cpu_backend.softmax(&mut scores);
+                }
 
                 // Weighted sum of values: attn_out_head = scores @ V_cached[:pos+1]
                 for t in 0..seq_len {
@@ -289,8 +317,16 @@ impl<'a> LlamaModel<'a> {
             }
 
             // 2f. Output projection + residual
-            let attn_proj = self.backend.matmul_vec(&layer.wo, &attn_out);
-            x = self.backend.add(&x, &attn_proj);
+            let attn_proj = if use_gpu {
+                self.backend.matmul_vec(&layer.wo, &attn_out)
+            } else {
+                self.cpu_backend.matmul_vec(&layer.wo, &attn_out)
+            };
+            x = if use_gpu {
+                self.backend.add(&x, &attn_proj)
+            } else {
+                self.cpu_backend.add(&x, &attn_proj)
+            };
 
             // 2g. FFN norm
             let ffn_norm_w = dequantize(
@@ -298,28 +334,68 @@ impl<'a> LlamaModel<'a> {
                 layer.ffn_norm.info.dtype,
                 layer.ffn_norm.info.n_elements(),
             );
-            let h = self.backend.rms_norm(&x, &ffn_norm_w, cfg.norm_eps);
+            let h = if use_gpu {
+                self.backend.rms_norm(&x, &ffn_norm_w, cfg.norm_eps)
+            } else {
+                self.cpu_backend.rms_norm(&x, &ffn_norm_w, cfg.norm_eps)
+            };
 
             // 2h. SwiGLU FFN: x = x + w2 @ (silu(w1 @ h) * (w3 @ h))
-            let gate = self.backend.matmul_vec(&layer.w1, &h);
-            let up = self.backend.matmul_vec(&layer.w3, &h);
-            let gate_act = self.backend.silu(&gate);
-            let ffn_hidden = self.backend.mul(&gate_act, &up);
-            let ffn_out = self.backend.matmul_vec(&layer.w2, &ffn_hidden);
+            let gate = if use_gpu {
+                self.backend.matmul_vec(&layer.w1, &h)
+            } else {
+                self.cpu_backend.matmul_vec(&layer.w1, &h)
+            };
+            let up = if use_gpu {
+                self.backend.matmul_vec(&layer.w3, &h)
+            } else {
+                self.cpu_backend.matmul_vec(&layer.w3, &h)
+            };
+            let gate_act = if use_gpu {
+                self.backend.silu(&gate)
+            } else {
+                self.cpu_backend.silu(&gate)
+            };
+            let ffn_hidden = if use_gpu {
+                self.backend.mul(&gate_act, &up)
+            } else {
+                self.cpu_backend.mul(&gate_act, &up)
+            };
+            let ffn_out = if use_gpu {
+                self.backend.matmul_vec(&layer.w2, &ffn_hidden)
+            } else {
+                self.cpu_backend.matmul_vec(&layer.w2, &ffn_hidden)
+            };
 
-            x = self.backend.add(&x, &ffn_out);
+            x = if use_gpu {
+                self.backend.add(&x, &ffn_out)
+            } else {
+                self.cpu_backend.add(&x, &ffn_out)
+            };
         }
 
         // 3. Final norm
+        let final_use_gpu = cfg.n_layers > 0
+            && self
+                .backend
+                .should_use_layer_gpu(cfg.n_layers - 1, cfg.n_layers);
         let output_norm_w = dequantize(
             w.output_norm.data,
             w.output_norm.info.dtype,
             w.output_norm.info.n_elements(),
         );
-        x = self.backend.rms_norm(&x, &output_norm_w, cfg.norm_eps);
+        x = if final_use_gpu {
+            self.backend.rms_norm(&x, &output_norm_w, cfg.norm_eps)
+        } else {
+            self.cpu_backend.rms_norm(&x, &output_norm_w, cfg.norm_eps)
+        };
 
         // 4. Output projection → logits [vocab_size]
-        let logits = self.backend.matmul_vec(&w.output, &x);
+        let logits = if final_use_gpu {
+            self.backend.matmul_vec(&w.output, &x)
+        } else {
+            self.cpu_backend.matmul_vec(&w.output, &x)
+        };
         Ok(logits)
     }
 }

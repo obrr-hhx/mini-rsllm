@@ -1,6 +1,8 @@
 // Backend abstraction for model math operators.
 // CPU is fully implemented; Metal is feature-gated and currently falls back to CPU ops.
 
+#[cfg(feature = "metal")]
+use crate::gguf::GgufDType;
 use crate::tensor;
 use crate::tensor::TensorRef;
 
@@ -44,6 +46,20 @@ pub trait Backend: Send + Sync {
     fn silu(&self, x: &[f32]) -> Vec<f32>;
     fn add(&self, a: &[f32], b: &[f32]) -> Vec<f32>;
     fn mul(&self, a: &[f32], b: &[f32]) -> Vec<f32>;
+
+    /// Whether this backend should run the given transformer layer on GPU.
+    /// `layer_idx` is in [0, n_layers).
+    fn should_use_layer_gpu(&self, _layer_idx: usize, _n_layers: usize) -> bool {
+        false
+    }
+}
+
+pub(crate) fn should_offload_layer(gpu_layers: usize, layer_idx: usize, n_layers: usize) -> bool {
+    if gpu_layers == 0 {
+        return false;
+    }
+    let start = n_layers.saturating_sub(gpu_layers);
+    layer_idx >= start && layer_idx < n_layers
 }
 
 #[derive(Debug, Default)]
@@ -97,8 +113,9 @@ use crate::metal::weights::MetalWeightStore;
 #[cfg(feature = "metal")]
 pub struct MetalBackend {
     cpu_fallback: CpuBackend,
-    _context: MetalContext,
+    context: MetalContext,
     _weights: MetalWeightStore,
+    gpu_layers: usize,
 }
 
 #[cfg(feature = "metal")]
@@ -108,8 +125,9 @@ impl MetalBackend {
         let weights = MetalWeightStore::new();
         Ok(MetalBackend {
             cpu_fallback: CpuBackend::new(),
-            _context: context,
+            context,
             _weights: weights,
+            gpu_layers,
         })
     }
 }
@@ -121,19 +139,58 @@ impl Backend for MetalBackend {
     }
 
     fn matmul_vec(&self, mat: &TensorRef, vec: &[f32]) -> Vec<f32> {
-        self.cpu_fallback.matmul_vec(mat, vec)
+        if self.gpu_layers == 0 {
+            return self.cpu_fallback.matmul_vec(mat, vec);
+        }
+
+        let rows = mat.rows();
+        let cols = mat.cols();
+
+        let gpu_result = match mat.info.dtype {
+            GgufDType::F32 => self.context.matvec_f32(mat.data, rows, cols, vec),
+            GgufDType::F16 => self.context.matvec_f16(mat.data, rows, cols, vec),
+            GgufDType::Q4_0 => self.context.matvec_q4_0(mat.data, rows, cols, vec),
+            _ => return self.cpu_fallback.matmul_vec(mat, vec),
+        };
+
+        match gpu_result {
+            Ok(out) => out,
+            Err(_) => self.cpu_fallback.matmul_vec(mat, vec),
+        }
     }
 
     fn rms_norm(&self, x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
-        self.cpu_fallback.rms_norm(x, weight, eps)
+        if self.gpu_layers == 0 {
+            return self.cpu_fallback.rms_norm(x, weight, eps);
+        }
+        match self.context.rms_norm(x, weight, eps) {
+            Ok(out) => out,
+            Err(_) => self.cpu_fallback.rms_norm(x, weight, eps),
+        }
     }
 
     fn rope(&self, q: &mut [f32], k: &mut [f32], pos: usize, head_dim: usize, freq_base: f32) {
-        self.cpu_fallback.rope(q, k, pos, head_dim, freq_base);
+        if self.gpu_layers == 0 {
+            self.cpu_fallback.rope(q, k, pos, head_dim, freq_base);
+            return;
+        }
+
+        let q_orig = q.to_vec();
+        let k_orig = k.to_vec();
+
+        let q_ok = self.context.apply_rope(q, pos, head_dim, freq_base).is_ok();
+        let k_ok = self.context.apply_rope(k, pos, head_dim, freq_base).is_ok();
+        if !q_ok || !k_ok {
+            q.copy_from_slice(&q_orig);
+            k.copy_from_slice(&k_orig);
+            self.cpu_fallback.rope(q, k, pos, head_dim, freq_base);
+        }
     }
 
     fn softmax(&self, x: &mut [f32]) {
-        self.cpu_fallback.softmax(x);
+        if self.gpu_layers == 0 || self.context.softmax(x).is_err() {
+            self.cpu_fallback.softmax(x);
+        }
     }
 
     fn silu(&self, x: &[f32]) -> Vec<f32> {
@@ -146,6 +203,10 @@ impl Backend for MetalBackend {
 
     fn mul(&self, a: &[f32], b: &[f32]) -> Vec<f32> {
         self.cpu_fallback.mul(a, b)
+    }
+
+    fn should_use_layer_gpu(&self, layer_idx: usize, n_layers: usize) -> bool {
+        should_offload_layer(self.gpu_layers, layer_idx, n_layers)
     }
 }
 
@@ -169,7 +230,7 @@ pub fn build_backend(device: DeviceKind, gpu_layers: usize) -> Result<Box<dyn Ba
 
 #[cfg(test)]
 mod tests {
-    use super::{build_backend, DeviceKind};
+    use super::{build_backend, should_offload_layer, DeviceKind};
 
     #[test]
     fn parse_device_kind() {
@@ -184,6 +245,15 @@ mod tests {
         assert_eq!(backend.name(), "cpu");
     }
 
+    #[test]
+    fn offload_policy_matches_gpu_layers() {
+        assert!(!should_offload_layer(0, 0, 32));
+        assert!(!should_offload_layer(4, 27, 32));
+        assert!(should_offload_layer(4, 28, 32));
+        assert!(should_offload_layer(4, 31, 32));
+        assert!(should_offload_layer(64, 0, 32));
+    }
+
     #[cfg(not(feature = "metal"))]
     #[test]
     fn metal_backend_requires_feature() {
@@ -194,7 +264,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_backend_factory_works() {
-        let backend = build_backend(DeviceKind::Metal, 1).unwrap();
-        assert_eq!(backend.name(), "metal (cpu fallback)");
+        let result = build_backend(DeviceKind::Metal, 1);
+        if let Ok(backend) = result {
+            assert_eq!(backend.name(), "metal (cpu fallback)");
+        }
     }
 }

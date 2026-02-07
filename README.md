@@ -34,6 +34,8 @@ mini-rsllm <model.gguf> [options]
 | `--top-p <F>` | Top-p / nucleus sampling | `0.9` |
 | `--top-k <N>` | Top-k sampling (0 = disable) | `40` |
 | `--seed <N>` | Random seed | `42` |
+| `--device <cpu\|metal>` | 运行后端类型 | `cpu` |
+| `--gpu-layers <N>` | 分配到 GPU 的 Transformer 层数（仅 Metal） | `0` |
 
 ### Examples
 
@@ -46,6 +48,26 @@ mini-rsllm <model.gguf> [options]
 
 # Code completion
 ./target/release/mini-rsllm model.gguf -p "def fibonacci(n):" -n 50 -t 0.0
+```
+
+### Metal (Apple Silicon)
+
+```bash
+# 构建 Metal 版本
+cargo build --release --features metal
+
+# 使用 Metal，默认把最后 N 层放到 GPU（N=0 表示全 CPU）
+./target/release/mini-rsllm model.gguf \
+  --device metal \
+  --gpu-layers 9999 \
+  -p "Hello" -n 64 -t 0.0
+```
+
+CPU/Metal 对比基准：
+
+```bash
+tasks/bench_cpu.sh model.gguf "Hello"
+tasks/bench_metal.sh model.gguf "Hello"
 ```
 
 ## Project Structure
