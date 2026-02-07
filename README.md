@@ -37,8 +37,8 @@ mini-rsllm <model.gguf> [options]
 | `--top-p <F>` | Top-p / nucleus sampling | `0.9` |
 | `--top-k <N>` | Top-k sampling (0 = disable) | `40` |
 | `--seed <N>` | Random seed | `42` |
-| `--device <cpu\|metal>` | 运行后端类型 | `cpu` |
-| `--gpu-layers <N>` | 分配到 GPU 的 Transformer 层数（仅 Metal） | `0` |
+| `--device <cpu\|metal>` | Runtime backend | `cpu` |
+| `--gpu-layers <N>` | Number of transformer layers offloaded to GPU (Metal only) | `0` |
 
 ### Examples
 
@@ -56,48 +56,48 @@ mini-rsllm <model.gguf> [options]
 ### Metal (Apple Silicon)
 
 ```bash
-# 构建 Metal 版本
+# Build with Metal support
 cargo build --release --features metal
 
-# 使用 Metal，默认把最后 N 层放到 GPU（N=0 表示全 CPU）
+# Run with Metal; by default, the last N layers are offloaded to GPU (N=0 means CPU-only)
 ./target/release/mini-rsllm model.gguf \
   --device metal \
   --gpu-layers 9999 \
   -p "Hello" -n 64 -t 0.0
 ```
 
-CPU/Metal 对比基准：
+CPU/Metal benchmark:
 
 ```bash
 bench/bench_cpu.sh model.gguf "Hello"
 bench/bench_metal.sh model.gguf "Hello"
 ```
 
-开启性能门槛（默认要求 `>= 2.0x`）：
+Enable performance gate (default requires `>= 2.0x`):
 
 ```bash
 ENFORCE_MIN_SPEEDUP=1 MIN_SPEEDUP=2.0 N_TOKENS=32 GPU_LAYERS=9999 \
 bench/bench_metal.sh model.gguf "Hello"
 ```
 
-Metal 回归与稳定性测试：
+Metal regression and stability tests:
 
 ```bash
-# 关键算子 + 端到端 parity（CPU vs Metal）
+# Operator-level and end-to-end parity (CPU vs Metal)
 cargo test --features metal --test metal_parity
 
-# 长时间稳定性（输出一致性 + RSS 增长阈值）
+# Long-run stability (output consistency + RSS growth threshold)
 scripts/soak_metal.sh model.gguf "Hello"
 ```
 
-可选环境变量：
+Optional environment variables:
 
-- `MINIRSLLM_TEST_MODEL`：指定 `tests/metal_parity.rs` 使用的模型路径
-- `ITERATIONS`：soak 循环次数（默认 `20`）
-- `MAX_RSS_GROWTH_KB`：允许的 RSS 增长阈值（默认 `262144`）
-- `MIN_SPEEDUP`：`bench_metal.sh` 速度门槛（默认 `2.0`）
-- `ENFORCE_MIN_SPEEDUP`：是否启用门槛（`1` 启用，默认 `0`）
-- `SKIP_METAL_PREFLIGHT`：跳过 `bench_metal.sh` Metal 预检查（默认 `0`）
+- `MINIRSLLM_TEST_MODEL`: model path used by `tests/metal_parity.rs`
+- `ITERATIONS`: soak loop count (default `20`)
+- `MAX_RSS_GROWTH_KB`: allowed RSS growth threshold (default `262144`)
+- `MIN_SPEEDUP`: speedup threshold for `bench_metal.sh` (default `2.0`)
+- `ENFORCE_MIN_SPEEDUP`: whether to enforce the threshold (`1` to enable, default `0`)
+- `SKIP_METAL_PREFLIGHT`: skip Metal preflight in `bench_metal.sh` (default `0`)
 
 ## Project Structure
 
@@ -171,8 +171,8 @@ huggingface-cli download TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF \
 
 ## CI
 
-- `cpu-checks`（Linux）：`cargo fmt --check` + `cargo test --all-targets`
-- `metal-smoke`（macOS）：`cargo build --release --features metal` + `cargo test --features metal --lib --tests`
+- `cpu-checks` (Linux): `cargo fmt --check` + `cargo test --all-targets`
+- `metal-smoke` (macOS): `cargo build --release --features metal` + `cargo test --features metal --lib --tests`
 
 ## License
 
