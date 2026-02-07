@@ -63,6 +63,18 @@ unsafe extern "C" {
         out: *mut f32,
         err: *mut *mut c_char,
     ) -> i32;
+    fn rsllm_metal_attn_layer(
+        q: *const f32,
+        layer: u32,
+        seq_len: u32,
+        n_heads: u32,
+        n_heads_per_kv: u32,
+        head_dim: u32,
+        kv_dim: u32,
+        scale: f32,
+        out: *mut f32,
+        err: *mut *mut c_char,
+    ) -> i32;
     fn rsllm_metal_softmax(input: *const f32, out: *mut f32, n: u32, err: *mut *mut c_char) -> i32;
     fn rsllm_metal_free_error(err: *mut c_char);
 }
@@ -467,6 +479,78 @@ impl MetalContext {
         }
     }
 
+    pub fn attention_layer(
+        &self,
+        q: &[f32],
+        layer_idx: usize,
+        seq_len: usize,
+        n_heads: usize,
+        n_heads_per_kv: usize,
+        head_dim: usize,
+        kv_dim: usize,
+        scale: f32,
+    ) -> Result<Vec<f32>, String> {
+        let expected = n_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| "attention_layer size overflow".to_string())?;
+        if q.len() != expected {
+            return Err(format!(
+                "attention_layer q shape mismatch: got {}, expected {}",
+                q.len(),
+                expected
+            ));
+        }
+        if n_heads == 0 || head_dim == 0 {
+            return Ok(Vec::new());
+        }
+        if n_heads_per_kv == 0 || n_heads % n_heads_per_kv != 0 {
+            return Err(format!(
+                "attention_layer invalid n_heads_per_kv: n_heads {}, n_heads_per_kv {}",
+                n_heads, n_heads_per_kv
+            ));
+        }
+        if kv_dim == 0 {
+            return Err("attention_layer requires kv_dim > 0".to_string());
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let mut out = vec![0.0f32; expected];
+            let mut err_ptr: *mut c_char = std::ptr::null_mut();
+            let status = unsafe {
+                rsllm_metal_attn_layer(
+                    q.as_ptr(),
+                    layer_idx as u32,
+                    seq_len as u32,
+                    n_heads as u32,
+                    n_heads_per_kv as u32,
+                    head_dim as u32,
+                    kv_dim as u32,
+                    scale,
+                    out.as_mut_ptr(),
+                    &mut err_ptr,
+                )
+            };
+            if status == 0 {
+                Ok(out)
+            } else {
+                Err(take_error_message(err_ptr))
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = q;
+            let _ = layer_idx;
+            let _ = seq_len;
+            let _ = n_heads;
+            let _ = n_heads_per_kv;
+            let _ = head_dim;
+            let _ = kv_dim;
+            let _ = scale;
+            Err("Metal backend is only available on macOS".to_string())
+        }
+    }
+
     pub fn softmax(&self, x: &mut [f32]) -> Result<(), String> {
         if x.is_empty() {
             return Ok(());
@@ -797,6 +881,80 @@ mod tests {
         }
 
         for i in 0..head_dim {
+            assert!(
+                (gpu[i] - cpu[i]).abs() < 1e-5,
+                "idx {} mismatch: gpu={}, cpu={}",
+                i,
+                gpu[i],
+                cpu[i]
+            );
+        }
+    }
+
+    #[test]
+    fn attention_layer_matches_cpu() {
+        let ctx = match MetalContext::new(0) {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        let layer_idx = 2usize;
+        let n_heads = 2usize;
+        let n_heads_per_kv = 1usize;
+        let head_dim = 2usize;
+        let kv_dim = 4usize;
+        let seq_len = 3usize;
+        let scale = (head_dim as f32).sqrt().recip();
+
+        let key_rows = [
+            [0.2f32, -0.1f32, 0.3f32, 0.4f32],
+            [0.1f32, 0.25f32, -0.2f32, 0.35f32],
+            [-0.15f32, 0.05f32, 0.45f32, -0.3f32],
+        ];
+        let val_rows = [
+            [0.7f32, -0.2f32, 0.1f32, 0.9f32],
+            [0.2f32, 0.3f32, -0.4f32, 0.6f32],
+            [-0.5f32, 0.8f32, 0.55f32, -0.25f32],
+        ];
+        for pos in 0..seq_len {
+            ctx.kv_store(layer_idx, pos, &key_rows[pos], &val_rows[pos], kv_dim)
+                .unwrap();
+        }
+
+        let q = [0.35f32, -0.6f32, -0.2f32, 0.5f32];
+        let gpu = ctx
+            .attention_layer(
+                &q,
+                layer_idx,
+                seq_len,
+                n_heads,
+                n_heads_per_kv,
+                head_dim,
+                kv_dim,
+                scale,
+            )
+            .unwrap();
+
+        let mut cpu = vec![0.0f32; n_heads * head_dim];
+        for qh in 0..n_heads {
+            let kv_head = qh / n_heads_per_kv;
+            let q_off = qh * head_dim;
+            let kv_off = kv_head * head_dim;
+            let mut scores = Vec::with_capacity(seq_len);
+            for t in 0..seq_len {
+                let k = key_rows[t];
+                let dot = q[q_off] * k[kv_off] + q[q_off + 1] * k[kv_off + 1];
+                scores.push(dot * scale);
+            }
+            tensor::softmax(&mut scores);
+            for t in 0..seq_len {
+                let v = val_rows[t];
+                cpu[q_off] += scores[t] * v[kv_off];
+                cpu[q_off + 1] += scores[t] * v[kv_off + 1];
+            }
+        }
+
+        for i in 0..cpu.len() {
             assert!(
                 (gpu[i] - cpu[i]).abs() < 1e-5,
                 "idx {} mismatch: gpu={}, cpu={}",

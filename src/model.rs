@@ -280,44 +280,35 @@ impl<'a> LlamaModel<'a> {
             }
 
             // 2e. Multi-head attention with GQA
-            let mut attn_out = vec![0.0f32; cfg.dim];
             let seq_len = pos + 1;
             let scale = 1.0 / (head_dim as f32).sqrt();
-
-            for qh in 0..cfg.n_heads {
-                let kv_head = qh / n_heads_per_kv;
-                let q_offset = qh * head_dim;
-                let kv_head_offset = kv_head * head_dim;
-                let q_head = &q[q_offset..q_offset + head_dim];
-
-                let head_out = if use_gpu {
-                    self.backend.attention_head(
-                        layer_idx,
-                        q_head,
-                        &self.kv_cache.key_cache[layer_idx],
-                        &self.kv_cache.val_cache[layer_idx],
-                        seq_len,
-                        kv_dim,
-                        kv_head_offset,
-                        scale,
-                    )
-                } else {
-                    self.cpu_backend.attention_head(
-                        layer_idx,
-                        q_head,
-                        &self.kv_cache.key_cache[layer_idx],
-                        &self.kv_cache.val_cache[layer_idx],
-                        seq_len,
-                        kv_dim,
-                        kv_head_offset,
-                        scale,
-                    )
-                };
-
-                for d in 0..head_dim {
-                    attn_out[q_offset + d] = head_out[d];
-                }
-            }
+            let attn_out = if use_gpu {
+                self.backend.attention_layer(
+                    layer_idx,
+                    &q,
+                    &self.kv_cache.key_cache[layer_idx],
+                    &self.kv_cache.val_cache[layer_idx],
+                    cfg.n_heads,
+                    n_heads_per_kv,
+                    head_dim,
+                    seq_len,
+                    kv_dim,
+                    scale,
+                )
+            } else {
+                self.cpu_backend.attention_layer(
+                    layer_idx,
+                    &q,
+                    &self.kv_cache.key_cache[layer_idx],
+                    &self.kv_cache.val_cache[layer_idx],
+                    cfg.n_heads,
+                    n_heads_per_kv,
+                    head_dim,
+                    seq_len,
+                    kv_dim,
+                    scale,
+                )
+            };
 
             // 2f. Output projection + residual
             let attn_proj = if use_gpu {

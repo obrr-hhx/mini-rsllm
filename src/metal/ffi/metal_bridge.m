@@ -14,8 +14,14 @@ static id<MTLComputePipelineState> g_pipeline_rms_norm = nil;
 static id<MTLComputePipelineState> g_pipeline_apply_rope = nil;
 static id<MTLComputePipelineState> g_pipeline_softmax = nil;
 static id<MTLComputePipelineState> g_pipeline_attn_head = nil;
+static id<MTLComputePipelineState> g_pipeline_attn_layer = nil;
+static NSMutableDictionary<NSString *, id<MTLBuffer>> *g_matrix_cache = nil;
 static NSMutableDictionary<NSNumber *, id<MTLBuffer>> *g_key_cache = nil;
 static NSMutableDictionary<NSNumber *, id<MTLBuffer>> *g_val_cache = nil;
+static id<MTLBuffer> g_matvec_vec_buf = nil;
+static id<MTLBuffer> g_matvec_out_buf = nil;
+static id<MTLBuffer> g_attn_q_buf = nil;
+static id<MTLBuffer> g_attn_out_buf = nil;
 static dispatch_once_t g_init_once;
 static char *g_init_error = NULL;
 
@@ -207,6 +213,64 @@ static const char *shader_source =
     "        acc += w * val_cache[base + gid];\n"
     "    }\n"
     "    out[gid] = acc;\n"
+    "}\n"
+    "kernel void attn_layer_f32(\n"
+    "    const device float* q             [[buffer(0)]],\n"
+    "    const device float* key_cache     [[buffer(1)]],\n"
+    "    const device float* val_cache     [[buffer(2)]],\n"
+    "    device float* out                 [[buffer(3)]],\n"
+    "    constant uint& seq_len            [[buffer(4)]],\n"
+    "    constant uint& n_heads            [[buffer(5)]],\n"
+    "    constant uint& n_heads_per_kv     [[buffer(6)]],\n"
+    "    constant uint& head_dim           [[buffer(7)]],\n"
+    "    constant uint& kv_dim             [[buffer(8)]],\n"
+    "    constant float& scale             [[buffer(9)]],\n"
+    "    uint gid                          [[thread_position_in_grid]]) {\n"
+    "    uint total = n_heads * head_dim;\n"
+    "    if (gid >= total) return;\n"
+    "    uint qh = gid / head_dim;\n"
+    "    uint d_out = gid % head_dim;\n"
+    "    uint q_base = qh * head_dim;\n"
+    "    uint kv_head = qh / n_heads_per_kv;\n"
+    "    uint kv_head_offset = kv_head * head_dim;\n"
+    "    if (seq_len == 0u) {\n"
+    "        out[gid] = 0.0f;\n"
+    "        return;\n"
+    "    }\n"
+    "    float max_score = -INFINITY;\n"
+    "    for (uint t = 0u; t < seq_len; ++t) {\n"
+    "        uint base = t * kv_dim + kv_head_offset;\n"
+    "        float dot = 0.0f;\n"
+    "        for (uint d = 0u; d < head_dim; ++d) {\n"
+    "            dot += q[q_base + d] * key_cache[base + d];\n"
+    "        }\n"
+    "        float s = dot * scale;\n"
+    "        if (s > max_score) max_score = s;\n"
+    "    }\n"
+    "    float denom = 0.0f;\n"
+    "    for (uint t = 0u; t < seq_len; ++t) {\n"
+    "        uint base = t * kv_dim + kv_head_offset;\n"
+    "        float dot = 0.0f;\n"
+    "        for (uint d = 0u; d < head_dim; ++d) {\n"
+    "            dot += q[q_base + d] * key_cache[base + d];\n"
+    "        }\n"
+    "        denom += exp(dot * scale - max_score);\n"
+    "    }\n"
+    "    if (denom <= 0.0f) {\n"
+    "        out[gid] = 0.0f;\n"
+    "        return;\n"
+    "    }\n"
+    "    float acc = 0.0f;\n"
+    "    for (uint t = 0u; t < seq_len; ++t) {\n"
+    "        uint base = t * kv_dim + kv_head_offset;\n"
+    "        float dot = 0.0f;\n"
+    "        for (uint d = 0u; d < head_dim; ++d) {\n"
+    "            dot += q[q_base + d] * key_cache[base + d];\n"
+    "        }\n"
+    "        float w = exp(dot * scale - max_score) / denom;\n"
+    "        acc += w * val_cache[base + d_out];\n"
+    "    }\n"
+    "    out[gid] = acc;\n"
     "}\n";
 
 static void init_metal_once(void) {
@@ -239,8 +303,9 @@ static void init_metal_once(void) {
         id<MTLFunction> rope_fn = [lib newFunctionWithName:@"apply_rope_f32"];
         id<MTLFunction> softmax_fn = [lib newFunctionWithName:@"softmax_f32"];
         id<MTLFunction> attn_fn = [lib newFunctionWithName:@"attn_head_f32"];
+        id<MTLFunction> attn_layer_fn = [lib newFunctionWithName:@"attn_layer_f32"];
         if (f32_fn == nil || f16_fn == nil || q4_fn == nil || rms_fn == nil ||
-            rope_fn == nil || softmax_fn == nil || attn_fn == nil) {
+            rope_fn == nil || softmax_fn == nil || attn_fn == nil || attn_layer_fn == nil) {
             set_init_error("failed to load required Metal functions from library");
             return;
         }
@@ -280,10 +345,58 @@ static void init_metal_once(void) {
             set_init_error(err.localizedDescription.UTF8String);
             return;
         }
+        g_pipeline_attn_layer = [g_device newComputePipelineStateWithFunction:attn_layer_fn error:&err];
+        if (g_pipeline_attn_layer == nil) {
+            set_init_error(err.localizedDescription.UTF8String);
+            return;
+        }
 
+        g_matrix_cache = [NSMutableDictionary dictionary];
         g_key_cache = [NSMutableDictionary dictionary];
         g_val_cache = [NSMutableDictionary dictionary];
     }
+}
+
+static id<MTLBuffer> ensure_scratch_buffer(id<MTLBuffer> __strong *slot, NSUInteger required_bytes, char **err) {
+    if (required_bytes == 0) {
+        required_bytes = sizeof(float);
+    }
+    if (*slot != nil && (*slot).length >= required_bytes) {
+        return *slot;
+    }
+    id<MTLBuffer> buf = [g_device newBufferWithLength:required_bytes options:MTLResourceStorageModeShared];
+    if (buf == nil) {
+        set_error(err, "failed to allocate Metal scratch buffer");
+        return nil;
+    }
+    *slot = buf;
+    return buf;
+}
+
+static id<MTLBuffer> get_or_create_matrix_buffer(
+    const void *matrix,
+    size_t matrix_bytes,
+    char **err
+) {
+    if (g_matrix_cache == nil) {
+        set_error(err, "Metal matrix cache is not initialized");
+        return nil;
+    }
+    NSString *key = [NSString stringWithFormat:@"%p:%zu", matrix, matrix_bytes];
+    id<MTLBuffer> matrix_buf = g_matrix_cache[key];
+    if (matrix_buf != nil) {
+        return matrix_buf;
+    }
+
+    matrix_buf = [g_device newBufferWithBytes:matrix
+                                       length:(NSUInteger)matrix_bytes
+                                      options:MTLResourceStorageModeShared];
+    if (matrix_buf == nil) {
+        set_error(err, "failed to allocate Metal matrix buffer");
+        return nil;
+    }
+    g_matrix_cache[key] = matrix_buf;
+    return matrix_buf;
 }
 
 static int run_matvec(
@@ -305,18 +418,16 @@ static int run_matvec(
     }
 
     @autoreleasepool {
-        id<MTLBuffer> matrix_buf = [g_device newBufferWithBytes:matrix
-                                                          length:matrix_bytes
-                                                         options:MTLResourceStorageModeShared];
-        id<MTLBuffer> vec_buf = [g_device newBufferWithBytes:vec
-                                                      length:(NSUInteger)cols * sizeof(float)
-                                                     options:MTLResourceStorageModeShared];
-        id<MTLBuffer> out_buf = [g_device newBufferWithLength:(NSUInteger)rows * sizeof(float)
-                                                      options:MTLResourceStorageModeShared];
-        if (matrix_buf == nil || vec_buf == nil || out_buf == nil) {
-            set_error(err, "failed to allocate Metal buffers");
+        id<MTLBuffer> matrix_buf = get_or_create_matrix_buffer(matrix, matrix_bytes, err);
+        if (matrix_buf == nil) {
             return 1;
         }
+        id<MTLBuffer> vec_buf = ensure_scratch_buffer(&g_matvec_vec_buf, (NSUInteger)cols * sizeof(float), err);
+        id<MTLBuffer> out_buf = ensure_scratch_buffer(&g_matvec_out_buf, (NSUInteger)rows * sizeof(float), err);
+        if (vec_buf == nil || out_buf == nil) {
+            return 1;
+        }
+        memcpy(vec_buf.contents, vec, (NSUInteger)cols * sizeof(float));
 
         id<MTLCommandBuffer> cb = [g_queue commandBuffer];
         if (cb == nil) {
@@ -683,15 +794,13 @@ static int run_attn_head(
     }
 
     @autoreleasepool {
-        id<MTLBuffer> q_buf = [g_device newBufferWithBytes:q
-                                                    length:(NSUInteger)head_dim * sizeof(float)
-                                                   options:MTLResourceStorageModeShared];
-        id<MTLBuffer> out_buf = [g_device newBufferWithLength:(NSUInteger)head_dim * sizeof(float)
-                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> q_buf = ensure_scratch_buffer(&g_attn_q_buf, (NSUInteger)head_dim * sizeof(float), err);
+        id<MTLBuffer> out_buf = ensure_scratch_buffer(&g_attn_out_buf, (NSUInteger)head_dim * sizeof(float), err);
         if (q_buf == nil || out_buf == nil) {
             set_error(err, "failed to allocate Metal buffers for attn_head");
             return 1;
         }
+        memcpy(q_buf.contents, q, (NSUInteger)head_dim * sizeof(float));
 
         id<MTLCommandBuffer> cb = [g_queue commandBuffer];
         if (cb == nil) {
@@ -733,6 +842,107 @@ static int run_attn_head(
         }
 
         memcpy(out, out_buf.contents, (NSUInteger)head_dim * sizeof(float));
+        return 0;
+    }
+}
+
+static int run_attn_layer(
+    const float *q,
+    uint32_t layer,
+    uint32_t seq_len,
+    uint32_t n_heads,
+    uint32_t n_heads_per_kv,
+    uint32_t head_dim,
+    uint32_t kv_dim,
+    float scale,
+    float *out,
+    char **err
+) {
+    if (q == NULL || out == NULL) {
+        set_error(err, "null pointer input for attn_layer");
+        return 1;
+    }
+    if (n_heads == 0 || head_dim == 0) {
+        return 0;
+    }
+    if (n_heads_per_kv == 0 || (n_heads % n_heads_per_kv) != 0u) {
+        set_error(err, "attn_layer requires valid n_heads_per_kv");
+        return 1;
+    }
+
+    size_t total = (size_t)n_heads * (size_t)head_dim;
+    if (seq_len == 0) {
+        memset(out, 0, total * sizeof(float));
+        return 0;
+    }
+
+    NSNumber *layer_key = @(layer);
+    id<MTLBuffer> key_buf = g_key_cache[layer_key];
+    id<MTLBuffer> val_buf = g_val_cache[layer_key];
+    if (key_buf == nil || val_buf == nil) {
+        set_error(err, "missing KV cache for requested layer");
+        return 1;
+    }
+
+    uint32_t max_kv_head = (n_heads - 1u) / n_heads_per_kv;
+    size_t max_offset = (size_t)max_kv_head * (size_t)head_dim;
+    size_t needed_elems = (size_t)(seq_len - 1u) * (size_t)kv_dim + max_offset + (size_t)head_dim;
+    size_t needed_bytes = needed_elems * sizeof(float);
+    if ((size_t)key_buf.length < needed_bytes || (size_t)val_buf.length < needed_bytes) {
+        set_error(err, "KV cache buffer is smaller than requested attention range");
+        return 1;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> q_buf = ensure_scratch_buffer(&g_attn_q_buf, (NSUInteger)(total * sizeof(float)), err);
+        id<MTLBuffer> out_buf = ensure_scratch_buffer(&g_attn_out_buf, (NSUInteger)(total * sizeof(float)), err);
+        if (q_buf == nil || out_buf == nil) {
+            set_error(err, "failed to allocate Metal buffers for attn_layer");
+            return 1;
+        }
+        memcpy(q_buf.contents, q, (NSUInteger)(total * sizeof(float)));
+
+        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+        if (cb == nil) {
+            set_error(err, "failed to create command buffer for attn_layer");
+            return 1;
+        }
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            set_error(err, "failed to create encoder for attn_layer");
+            return 1;
+        }
+
+        [enc setComputePipelineState:g_pipeline_attn_layer];
+        [enc setBuffer:q_buf offset:0 atIndex:0];
+        [enc setBuffer:key_buf offset:0 atIndex:1];
+        [enc setBuffer:val_buf offset:0 atIndex:2];
+        [enc setBuffer:out_buf offset:0 atIndex:3];
+        [enc setBytes:&seq_len length:sizeof(uint32_t) atIndex:4];
+        [enc setBytes:&n_heads length:sizeof(uint32_t) atIndex:5];
+        [enc setBytes:&n_heads_per_kv length:sizeof(uint32_t) atIndex:6];
+        [enc setBytes:&head_dim length:sizeof(uint32_t) atIndex:7];
+        [enc setBytes:&kv_dim length:sizeof(uint32_t) atIndex:8];
+        [enc setBytes:&scale length:sizeof(float) atIndex:9];
+
+        NSUInteger thread_width = g_pipeline_attn_layer.threadExecutionWidth;
+        if (thread_width == 0) thread_width = 1;
+        NSUInteger tg_width = (NSUInteger)total < thread_width ? (NSUInteger)total : thread_width;
+        if (tg_width == 0) tg_width = 1;
+        MTLSize threads_per_tg = MTLSizeMake(tg_width, 1, 1);
+        MTLSize tg_count = MTLSizeMake(((NSUInteger)total + tg_width - 1) / tg_width, 1, 1);
+        [enc dispatchThreadgroups:tg_count threadsPerThreadgroup:threads_per_tg];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            const char *msg = cb.error.localizedDescription.UTF8String;
+            set_error(err, msg ? msg : "Metal attn_layer command failed");
+            return 1;
+        }
+
+        memcpy(out, out_buf.contents, (NSUInteger)(total * sizeof(float)));
         return 0;
     }
 }
@@ -906,6 +1116,39 @@ int rsllm_metal_attn_head(
         kv_dim,
         kv_head_offset,
         head_dim,
+        scale,
+        out,
+        err
+    );
+}
+
+int rsllm_metal_attn_layer(
+    const float *q,
+    uint32_t layer,
+    uint32_t seq_len,
+    uint32_t n_heads,
+    uint32_t n_heads_per_kv,
+    uint32_t head_dim,
+    uint32_t kv_dim,
+    float scale,
+    float *out,
+    char **err
+) {
+    dispatch_once(&g_init_once, ^{
+      init_metal_once();
+    });
+    if (g_init_error != NULL) {
+        set_error(err, g_init_error);
+        return 1;
+    }
+    return run_attn_layer(
+        q,
+        layer,
+        seq_len,
+        n_heads,
+        n_heads_per_kv,
+        head_dim,
+        kv_dim,
         scale,
         out,
         err

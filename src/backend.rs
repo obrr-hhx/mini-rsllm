@@ -80,6 +80,39 @@ pub trait Backend: Send + Sync {
         }
         out
     }
+    fn attention_layer(
+        &self,
+        layer_idx: usize,
+        q: &[f32],
+        key_cache_layer: &[f32],
+        val_cache_layer: &[f32],
+        n_heads: usize,
+        n_heads_per_kv: usize,
+        head_dim: usize,
+        seq_len: usize,
+        kv_dim: usize,
+        scale: f32,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; n_heads * head_dim];
+        for qh in 0..n_heads {
+            let kv_head = qh / n_heads_per_kv;
+            let q_offset = qh * head_dim;
+            let kv_head_offset = kv_head * head_dim;
+            let q_head = &q[q_offset..q_offset + head_dim];
+            let head_out = self.attention_head(
+                layer_idx,
+                q_head,
+                key_cache_layer,
+                val_cache_layer,
+                seq_len,
+                kv_dim,
+                kv_head_offset,
+                scale,
+            );
+            out[q_offset..q_offset + head_dim].copy_from_slice(&head_out);
+        }
+        out
+    }
 
     /// Whether this backend should run the given transformer layer on GPU.
     /// `layer_idx` is in [0, n_layers).
@@ -283,6 +316,60 @@ impl Backend for MetalBackend {
                 seq_len,
                 kv_dim,
                 kv_head_offset,
+                scale,
+            ),
+        }
+    }
+
+    fn attention_layer(
+        &self,
+        layer_idx: usize,
+        q: &[f32],
+        key_cache_layer: &[f32],
+        val_cache_layer: &[f32],
+        n_heads: usize,
+        n_heads_per_kv: usize,
+        head_dim: usize,
+        seq_len: usize,
+        kv_dim: usize,
+        scale: f32,
+    ) -> Vec<f32> {
+        if self.gpu_layers == 0 {
+            return self.cpu_fallback.attention_layer(
+                layer_idx,
+                q,
+                key_cache_layer,
+                val_cache_layer,
+                n_heads,
+                n_heads_per_kv,
+                head_dim,
+                seq_len,
+                kv_dim,
+                scale,
+            );
+        }
+
+        match self.context.attention_layer(
+            q,
+            layer_idx,
+            seq_len,
+            n_heads,
+            n_heads_per_kv,
+            head_dim,
+            kv_dim,
+            scale,
+        ) {
+            Ok(out) => out,
+            Err(_) => self.cpu_fallback.attention_layer(
+                layer_idx,
+                q,
+                key_cache_layer,
+                val_cache_layer,
+                n_heads,
+                n_heads_per_kv,
+                head_dim,
+                seq_len,
+                kv_dim,
                 scale,
             ),
         }
