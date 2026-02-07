@@ -6,6 +6,9 @@ A minimal LLM inference engine written from scratch in Rust. Loads real GGUF mod
 
 - **GGUF v2/v3 parser** with memory-mapped file I/O (no full model copy into RAM)
 - **LLaMA architecture**: RMS normalization, RoPE, grouped-query attention (GQA), SwiGLU FFN
+- **Metal backend (Apple Silicon)** with layer offload (`--gpu-layers`) and CPU fallback
+- **Small-vector Metal fusion**: fused `rope_qk` and fused `add + rms_norm` paths for decode hot path
+- **Reduced small-op overhead**: scratch `MTLBuffer` reuse for `rms_norm` / `rope` / `softmax`
 - **Quantization support**: F32, F16, Q4_0, Q8_0, Q6_K — dequantized on-the-fly during matrix-vector multiply
 - **SentencePiece-style BPE tokenizer** loaded from GGUF metadata, with byte fallback
 - **Sampling**: temperature, top-k, top-p (nucleus), with reproducible xorshift64 PRNG
@@ -66,8 +69,15 @@ cargo build --release --features metal
 CPU/Metal 对比基准：
 
 ```bash
-tasks/bench_cpu.sh model.gguf "Hello"
-tasks/bench_metal.sh model.gguf "Hello"
+bench/bench_cpu.sh model.gguf "Hello"
+bench/bench_metal.sh model.gguf "Hello"
+```
+
+开启性能门槛（默认要求 `>= 2.0x`）：
+
+```bash
+ENFORCE_MIN_SPEEDUP=1 MIN_SPEEDUP=2.0 N_TOKENS=32 GPU_LAYERS=9999 \
+bench/bench_metal.sh model.gguf "Hello"
 ```
 
 Metal 回归与稳定性测试：
@@ -85,6 +95,9 @@ scripts/soak_metal.sh model.gguf "Hello"
 - `MINIRSLLM_TEST_MODEL`：指定 `tests/metal_parity.rs` 使用的模型路径
 - `ITERATIONS`：soak 循环次数（默认 `20`）
 - `MAX_RSS_GROWTH_KB`：允许的 RSS 增长阈值（默认 `262144`）
+- `MIN_SPEEDUP`：`bench_metal.sh` 速度门槛（默认 `2.0`）
+- `ENFORCE_MIN_SPEEDUP`：是否启用门槛（`1` 启用，默认 `0`）
+- `SKIP_METAL_PREFLIGHT`：跳过 `bench_metal.sh` Metal 预检查（默认 `0`）
 
 ## Project Structure
 
@@ -120,11 +133,11 @@ For each token, the forward pass runs through all transformer layers:
 2. **For each layer:**
    - RMS normalize the hidden state
    - Project to Q, K, V via quantized matrix-vector multiply
-   - Apply rotary position embeddings (RoPE) to Q and K
+   - Apply rotary position embeddings (RoPE) to Q and K (Metal path uses fused `rope_qk`)
    - Store K, V into the KV cache
    - Multi-head attention with GQA (grouped-query attention)
-   - Output projection + residual connection
-   - RMS normalize, then SwiGLU FFN (gate/up/down projections) + residual
+   - Output projection + residual connection (Metal path fuses `add + rms_norm` for FFN input)
+   - SwiGLU FFN (gate/up/down projections) + residual
 3. **Final RMS norm** and output projection to logits
 
 All weight matrices are dequantized on-the-fly during dot products — one row at a time — so memory usage stays proportional to the model file size, not the full f32 parameter count.
