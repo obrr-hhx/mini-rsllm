@@ -44,6 +44,25 @@ unsafe extern "C" {
         freq_base: f32,
         err: *mut *mut c_char,
     ) -> i32;
+    fn rsllm_metal_kv_store(
+        layer: u32,
+        pos: u32,
+        key: *const f32,
+        val: *const f32,
+        kv_dim: u32,
+        err: *mut *mut c_char,
+    ) -> i32;
+    fn rsllm_metal_attn_head(
+        q: *const f32,
+        layer: u32,
+        seq_len: u32,
+        kv_dim: u32,
+        kv_head_offset: u32,
+        head_dim: u32,
+        scale: f32,
+        out: *mut f32,
+        err: *mut *mut c_char,
+    ) -> i32;
     fn rsllm_metal_softmax(input: *const f32, out: *mut f32, n: u32, err: *mut *mut c_char) -> i32;
     fn rsllm_metal_free_error(err: *mut c_char);
 }
@@ -343,6 +362,111 @@ impl MetalContext {
         }
     }
 
+    pub fn kv_store(
+        &self,
+        layer_idx: usize,
+        pos: usize,
+        key: &[f32],
+        val: &[f32],
+        kv_dim: usize,
+    ) -> Result<(), String> {
+        if key.len() != kv_dim || val.len() != kv_dim {
+            return Err(format!(
+                "kv_store shape mismatch: key {}, val {}, kv_dim {}",
+                key.len(),
+                val.len(),
+                kv_dim
+            ));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let mut err_ptr: *mut c_char = std::ptr::null_mut();
+            let status = unsafe {
+                rsllm_metal_kv_store(
+                    layer_idx as u32,
+                    pos as u32,
+                    key.as_ptr(),
+                    val.as_ptr(),
+                    kv_dim as u32,
+                    &mut err_ptr,
+                )
+            };
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(take_error_message(err_ptr))
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = layer_idx;
+            let _ = pos;
+            let _ = key;
+            let _ = val;
+            let _ = kv_dim;
+            Err("Metal backend is only available on macOS".to_string())
+        }
+    }
+
+    pub fn attention_head(
+        &self,
+        q_head: &[f32],
+        layer_idx: usize,
+        seq_len: usize,
+        kv_dim: usize,
+        kv_head_offset: usize,
+        scale: f32,
+    ) -> Result<Vec<f32>, String> {
+        let head_dim = q_head.len();
+        if head_dim == 0 {
+            return Ok(Vec::new());
+        }
+        if seq_len == 0 {
+            return Ok(vec![0.0f32; head_dim]);
+        }
+        if kv_head_offset + head_dim > kv_dim {
+            return Err(format!(
+                "attention_head range overflow: kv_head_offset {} + head_dim {} > kv_dim {}",
+                kv_head_offset, head_dim, kv_dim
+            ));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let mut out = vec![0.0f32; head_dim];
+            let mut err_ptr: *mut c_char = std::ptr::null_mut();
+            let status = unsafe {
+                rsllm_metal_attn_head(
+                    q_head.as_ptr(),
+                    layer_idx as u32,
+                    seq_len as u32,
+                    kv_dim as u32,
+                    kv_head_offset as u32,
+                    head_dim as u32,
+                    scale,
+                    out.as_mut_ptr(),
+                    &mut err_ptr,
+                )
+            };
+            if status == 0 {
+                Ok(out)
+            } else {
+                Err(take_error_message(err_ptr))
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = q_head;
+            let _ = layer_idx;
+            let _ = seq_len;
+            let _ = kv_dim;
+            let _ = kv_head_offset;
+            let _ = scale;
+            Err("Metal backend is only available on macOS".to_string())
+        }
+    }
+
     pub fn softmax(&self, x: &mut [f32]) -> Result<(), String> {
         if x.is_empty() {
             return Ok(());
@@ -613,6 +737,66 @@ mod tests {
         tensor::softmax(&mut cpu);
 
         for i in 0..gpu.len() {
+            assert!(
+                (gpu[i] - cpu[i]).abs() < 1e-5,
+                "idx {} mismatch: gpu={}, cpu={}",
+                i,
+                gpu[i],
+                cpu[i]
+            );
+        }
+    }
+
+    #[test]
+    fn attention_head_matches_cpu() {
+        let ctx = match MetalContext::new(0) {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        let layer_idx = 1usize;
+        let kv_dim = 4usize;
+        let head_dim = 2usize;
+        let seq_len = 3usize;
+        let kv_head_offset = 2usize;
+        let scale = (head_dim as f32).sqrt().recip();
+
+        let key_rows = [
+            [0.2f32, -0.1f32, 0.3f32, 0.4f32],
+            [0.1f32, 0.25f32, -0.2f32, 0.35f32],
+            [-0.15f32, 0.05f32, 0.45f32, -0.3f32],
+        ];
+        let val_rows = [
+            [0.7f32, -0.2f32, 0.1f32, 0.9f32],
+            [0.2f32, 0.3f32, -0.4f32, 0.6f32],
+            [-0.5f32, 0.8f32, 0.55f32, -0.25f32],
+        ];
+        for pos in 0..seq_len {
+            ctx.kv_store(layer_idx, pos, &key_rows[pos], &val_rows[pos], kv_dim)
+                .unwrap();
+        }
+
+        let q_head = [0.35f32, -0.6f32];
+        let gpu = ctx
+            .attention_head(&q_head, layer_idx, seq_len, kv_dim, kv_head_offset, scale)
+            .unwrap();
+
+        let mut scores = Vec::with_capacity(seq_len);
+        for t in 0..seq_len {
+            let k = key_rows[t];
+            let dot = q_head[0] * k[kv_head_offset] + q_head[1] * k[kv_head_offset + 1];
+            scores.push(dot * scale);
+        }
+        tensor::softmax(&mut scores);
+        let mut cpu = vec![0.0f32; head_dim];
+        for t in 0..seq_len {
+            let v = val_rows[t];
+            for d in 0..head_dim {
+                cpu[d] += scores[t] * v[kv_head_offset + d];
+            }
+        }
+
+        for i in 0..head_dim {
             assert!(
                 (gpu[i] - cpu[i]).abs() < 1e-5,
                 "idx {} mismatch: gpu={}, cpu={}",

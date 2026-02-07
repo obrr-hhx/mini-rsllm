@@ -275,44 +275,47 @@ impl<'a> LlamaModel<'a> {
             let kv_offset = pos * kv_dim;
             self.kv_cache.key_cache[layer_idx][kv_offset..kv_offset + kv_dim].copy_from_slice(&k);
             self.kv_cache.val_cache[layer_idx][kv_offset..kv_offset + kv_dim].copy_from_slice(&v);
+            if use_gpu {
+                self.backend.store_kv(layer_idx, pos, &k, &v, kv_dim);
+            }
 
             // 2e. Multi-head attention with GQA
             let mut attn_out = vec![0.0f32; cfg.dim];
+            let seq_len = pos + 1;
+            let scale = 1.0 / (head_dim as f32).sqrt();
 
             for qh in 0..cfg.n_heads {
                 let kv_head = qh / n_heads_per_kv;
                 let q_offset = qh * head_dim;
                 let kv_head_offset = kv_head * head_dim;
+                let q_head = &q[q_offset..q_offset + head_dim];
 
-                // Compute attention scores: q_head @ K_cached[:pos+1]^T / sqrt(head_dim)
-                let seq_len = pos + 1;
-                let mut scores = Vec::with_capacity(seq_len);
-                let scale = 1.0 / (head_dim as f32).sqrt();
-
-                for t in 0..seq_len {
-                    let k_base = t * kv_dim + kv_head_offset;
-                    let mut dot = 0.0f32;
-                    for d in 0..head_dim {
-                        dot += q[q_offset + d] * self.kv_cache.key_cache[layer_idx][k_base + d];
-                    }
-                    scores.push(dot * scale);
-                }
-
-                // Softmax over scores
-                if use_gpu {
-                    self.backend.softmax(&mut scores);
+                let head_out = if use_gpu {
+                    self.backend.attention_head(
+                        layer_idx,
+                        q_head,
+                        &self.kv_cache.key_cache[layer_idx],
+                        &self.kv_cache.val_cache[layer_idx],
+                        seq_len,
+                        kv_dim,
+                        kv_head_offset,
+                        scale,
+                    )
                 } else {
-                    self.cpu_backend.softmax(&mut scores);
-                }
+                    self.cpu_backend.attention_head(
+                        layer_idx,
+                        q_head,
+                        &self.kv_cache.key_cache[layer_idx],
+                        &self.kv_cache.val_cache[layer_idx],
+                        seq_len,
+                        kv_dim,
+                        kv_head_offset,
+                        scale,
+                    )
+                };
 
-                // Weighted sum of values: attn_out_head = scores @ V_cached[:pos+1]
-                for t in 0..seq_len {
-                    let v_base = t * kv_dim + kv_head_offset;
-                    let s = scores[t];
-                    for d in 0..head_dim {
-                        attn_out[q_offset + d] +=
-                            s * self.kv_cache.val_cache[layer_idx][v_base + d];
-                    }
+                for d in 0..head_dim {
+                    attn_out[q_offset + d] = head_out[d];
                 }
             }
 

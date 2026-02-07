@@ -46,6 +46,40 @@ pub trait Backend: Send + Sync {
     fn silu(&self, x: &[f32]) -> Vec<f32>;
     fn add(&self, a: &[f32], b: &[f32]) -> Vec<f32>;
     fn mul(&self, a: &[f32], b: &[f32]) -> Vec<f32>;
+    fn store_kv(&self, _layer_idx: usize, _pos: usize, _k: &[f32], _v: &[f32], _kv_dim: usize) {}
+    fn attention_head(
+        &self,
+        _layer_idx: usize,
+        q_head: &[f32],
+        key_cache_layer: &[f32],
+        val_cache_layer: &[f32],
+        seq_len: usize,
+        kv_dim: usize,
+        kv_head_offset: usize,
+        scale: f32,
+    ) -> Vec<f32> {
+        let head_dim = q_head.len();
+        let mut scores = Vec::with_capacity(seq_len);
+        for t in 0..seq_len {
+            let k_base = t * kv_dim + kv_head_offset;
+            let mut dot = 0.0f32;
+            for d in 0..head_dim {
+                dot += q_head[d] * key_cache_layer[k_base + d];
+            }
+            scores.push(dot * scale);
+        }
+        self.softmax(&mut scores);
+
+        let mut out = vec![0.0f32; head_dim];
+        for t in 0..seq_len {
+            let v_base = t * kv_dim + kv_head_offset;
+            let s = scores[t];
+            for d in 0..head_dim {
+                out[d] += s * val_cache_layer[v_base + d];
+            }
+        }
+        out
+    }
 
     /// Whether this backend should run the given transformer layer on GPU.
     /// `layer_idx` is in [0, n_layers).
@@ -203,6 +237,55 @@ impl Backend for MetalBackend {
 
     fn mul(&self, a: &[f32], b: &[f32]) -> Vec<f32> {
         self.cpu_fallback.mul(a, b)
+    }
+
+    fn store_kv(&self, layer_idx: usize, pos: usize, k: &[f32], v: &[f32], kv_dim: usize) {
+        if self.gpu_layers == 0 {
+            return;
+        }
+        let _ = self.context.kv_store(layer_idx, pos, k, v, kv_dim);
+    }
+
+    fn attention_head(
+        &self,
+        layer_idx: usize,
+        q_head: &[f32],
+        key_cache_layer: &[f32],
+        val_cache_layer: &[f32],
+        seq_len: usize,
+        kv_dim: usize,
+        kv_head_offset: usize,
+        scale: f32,
+    ) -> Vec<f32> {
+        if self.gpu_layers == 0 {
+            return self.cpu_fallback.attention_head(
+                layer_idx,
+                q_head,
+                key_cache_layer,
+                val_cache_layer,
+                seq_len,
+                kv_dim,
+                kv_head_offset,
+                scale,
+            );
+        }
+
+        match self
+            .context
+            .attention_head(q_head, layer_idx, seq_len, kv_dim, kv_head_offset, scale)
+        {
+            Ok(out) => out,
+            Err(_) => self.cpu_fallback.attention_head(
+                layer_idx,
+                q_head,
+                key_cache_layer,
+                val_cache_layer,
+                seq_len,
+                kv_dim,
+                kv_head_offset,
+                scale,
+            ),
+        }
     }
 
     fn should_use_layer_gpu(&self, layer_idx: usize, n_layers: usize) -> bool {
