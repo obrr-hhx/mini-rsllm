@@ -181,7 +181,7 @@ use crate::metal::weights::MetalWeightStore;
 pub struct MetalBackend {
     cpu_fallback: CpuBackend,
     context: MetalContext,
-    _weights: MetalWeightStore,
+    weights: MetalWeightStore,
     gpu_layers: usize,
 }
 
@@ -193,7 +193,7 @@ impl MetalBackend {
         Ok(MetalBackend {
             cpu_fallback: CpuBackend::new(),
             context,
-            _weights: weights,
+            weights,
             gpu_layers,
         })
     }
@@ -209,6 +209,8 @@ impl Backend for MetalBackend {
         if self.gpu_layers == 0 {
             return self.cpu_fallback.matmul_vec(mat, vec);
         }
+
+        self.weights.register_tensor(&mat.info, mat.data);
 
         let rows = mat.rows();
         let cols = mat.cols();
@@ -402,6 +404,31 @@ pub fn build_backend(device: DeviceKind, gpu_layers: usize) -> Result<Box<dyn Ba
 mod tests {
     use super::{build_backend, should_offload_layer, DeviceKind};
 
+    fn argmax(values: &[f32]) -> usize {
+        let mut best_idx = 0usize;
+        let mut best_val = f32::NEG_INFINITY;
+        for (i, &v) in values.iter().enumerate() {
+            if v > best_val {
+                best_val = v;
+                best_idx = i;
+            }
+        }
+        best_idx
+    }
+
+    fn make_logits(seed: u64, n: usize) -> Vec<f32> {
+        let mut s = seed ^ 0xA5A5_5A5A_F0F0_0F0F;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            let x = (s as f32) / (u64::MAX as f32);
+            out.push(x * 12.0 - 6.0);
+        }
+        out
+    }
+
     #[test]
     fn parse_device_kind() {
         assert_eq!("cpu".parse::<DeviceKind>().unwrap(), DeviceKind::Cpu);
@@ -438,5 +465,39 @@ mod tests {
         if let Ok(backend) = result {
             assert_eq!(backend.name(), "metal (cpu fallback)");
         }
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn greedy_top1_consistency_cpu_vs_metal() {
+        let cpu = build_backend(DeviceKind::Cpu, 0).unwrap();
+        let metal = match build_backend(DeviceKind::Metal, 9999) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+
+        let mut same = 0usize;
+        let trials = 96usize;
+        for i in 0..trials {
+            let logits = make_logits(1000 + i as u64 * 17, 128);
+
+            let mut cpu_probs = logits.clone();
+            let mut metal_probs = logits.clone();
+            cpu.softmax(&mut cpu_probs);
+            metal.softmax(&mut metal_probs);
+
+            if argmax(&cpu_probs) == argmax(&metal_probs) {
+                same += 1;
+            }
+        }
+
+        let ratio = same as f32 / trials as f32;
+        assert!(
+            ratio >= 0.99,
+            "top-1 consistency too low: {:.4} ({} / {})",
+            ratio,
+            same,
+            trials
+        );
     }
 }

@@ -70,16 +70,40 @@ tasks/bench_cpu.sh model.gguf "Hello"
 tasks/bench_metal.sh model.gguf "Hello"
 ```
 
+Metal 回归与稳定性测试：
+
+```bash
+# 关键算子 + 端到端 parity（CPU vs Metal）
+cargo test --features metal --test metal_parity
+
+# 长时间稳定性（输出一致性 + RSS 增长阈值）
+scripts/soak_metal.sh model.gguf "Hello"
+```
+
+可选环境变量：
+
+- `MINIRSLLM_TEST_MODEL`：指定 `tests/metal_parity.rs` 使用的模型路径
+- `ITERATIONS`：soak 循环次数（默认 `20`）
+- `MAX_RSS_GROWTH_KB`：允许的 RSS 增长阈值（默认 `262144`）
+
 ## Project Structure
 
 ```
 src/
+├── lib.rs         Library entry (for tests and reuse in bin)
 ├── main.rs        CLI entry point, arg parsing, generation loop
 ├── gguf.rs        GGUF v2/v3 binary format parser
 ├── tensor.rs      Tensor storage, dequantization, math operations
 ├── model.rs       LLaMA model: config, weights, KV cache, forward pass
 ├── tokenizer.rs   BPE tokenizer: encode text → tokens, decode tokens → text
-└── sampler.rs     Temperature, top-k, top-p sampling
+├── sampler.rs     Temperature, top-k, top-p sampling
+└── metal/         Metal backend, kernels, and bridge
+
+tests/
+└── metal_parity.rs  CPU vs Metal numerical parity and greedy decode parity
+
+scripts/
+└── soak_metal.sh  Metal soak test (stability + memory growth guard)
 ```
 
 ## How It Works
@@ -131,6 +155,11 @@ huggingface-cli download TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF \
 ```
 
 > **Note**: Chat-finetuned models (like TinyLlama-Chat) work best with their expected chat template format. For raw text completion, base (non-chat) models will give more predictable results.
+
+## CI
+
+- `cpu-checks`（Linux）：`cargo fmt --check` + `cargo test --all-targets`
+- `metal-smoke`（macOS）：`cargo build --release --features metal` + `cargo test --features metal --lib --tests`
 
 ## License
 

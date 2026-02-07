@@ -129,3 +129,97 @@ fn argmax(values: &[f32]) -> u32 {
     }
     best_idx as u32
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Sampler, SamplerConfig};
+
+    fn make_logits(seed: u64, n: usize) -> Vec<f32> {
+        let mut s = seed ^ 0x9E37_79B9_7F4A_7C15;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            let x = (s as f32) / (u64::MAX as f32);
+            out.push(x * 8.0 - 4.0);
+        }
+        out
+    }
+
+    #[test]
+    fn temperature_zero_is_always_greedy() {
+        let mut sampler = Sampler::new(SamplerConfig {
+            temperature: 0.0,
+            top_k: 1,
+            top_p: 0.1,
+            seed: 123,
+        });
+        let mut logits = vec![-1.0f32, 2.0f32, 0.5f32, 1.9f32];
+        let token = sampler.sample(&mut logits);
+        assert_eq!(token, 1);
+    }
+
+    #[test]
+    fn fixed_seed_sampling_is_reproducible() {
+        let cfg = SamplerConfig {
+            temperature: 0.8,
+            top_k: 40,
+            top_p: 0.95,
+            seed: 42,
+        };
+        let mut a = Sampler::new(SamplerConfig {
+            temperature: cfg.temperature,
+            top_k: cfg.top_k,
+            top_p: cfg.top_p,
+            seed: cfg.seed,
+        });
+        let mut b = Sampler::new(SamplerConfig {
+            temperature: cfg.temperature,
+            top_k: cfg.top_k,
+            top_p: cfg.top_p,
+            seed: cfg.seed,
+        });
+
+        for step in 0..200u64 {
+            let mut logits_a = make_logits(step * 7919 + 17, 128);
+            let mut logits_b = logits_a.clone();
+            let ta = a.sample(&mut logits_a);
+            let tb = b.sample(&mut logits_b);
+            assert_eq!(ta, tb, "mismatch at step {}", step);
+        }
+    }
+
+    #[test]
+    fn different_seed_changes_sampling_path() {
+        let mut a = Sampler::new(SamplerConfig {
+            temperature: 0.8,
+            top_k: 40,
+            top_p: 0.95,
+            seed: 1,
+        });
+        let mut b = Sampler::new(SamplerConfig {
+            temperature: 0.8,
+            top_k: 40,
+            top_p: 0.95,
+            seed: 2,
+        });
+
+        let mut differs = false;
+        for step in 0..120u64 {
+            let mut logits_a = make_logits(step * 104729 + 31, 96);
+            let mut logits_b = logits_a.clone();
+            let ta = a.sample(&mut logits_a);
+            let tb = b.sample(&mut logits_b);
+            if ta != tb {
+                differs = true;
+                break;
+            }
+        }
+
+        assert!(
+            differs,
+            "different seeds unexpectedly produced identical path"
+        );
+    }
+}

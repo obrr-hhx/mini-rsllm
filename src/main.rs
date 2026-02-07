@@ -1,22 +1,14 @@
 // mini-rsllm: A minimal Rust LLM inference engine
 // CLI entry point with arg parsing and generation loop.
 
-mod backend;
-mod gguf;
-#[cfg(feature = "metal")]
-mod metal;
-mod model;
-mod sampler;
-mod tensor;
-mod tokenizer;
-
 use std::io::{self, Write};
 use std::time::Instant;
 
-use backend::{build_backend, DeviceKind};
-use model::LlamaModel;
-use sampler::{Sampler, SamplerConfig};
-use tokenizer::Tokenizer;
+use mini_rsllm::backend::{build_backend, DeviceKind};
+use mini_rsllm::gguf;
+use mini_rsllm::model::LlamaModel;
+use mini_rsllm::sampler::{Sampler, SamplerConfig};
+use mini_rsllm::tokenizer::Tokenizer;
 
 struct Args {
     model_path: String,
