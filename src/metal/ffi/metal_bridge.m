@@ -11,7 +11,9 @@ static id<MTLComputePipelineState> g_pipeline_f32 = nil;
 static id<MTLComputePipelineState> g_pipeline_f16 = nil;
 static id<MTLComputePipelineState> g_pipeline_q4_0 = nil;
 static id<MTLComputePipelineState> g_pipeline_rms_norm = nil;
+static id<MTLComputePipelineState> g_pipeline_add_rms_norm = nil;
 static id<MTLComputePipelineState> g_pipeline_apply_rope = nil;
+static id<MTLComputePipelineState> g_pipeline_apply_rope_qk = nil;
 static id<MTLComputePipelineState> g_pipeline_softmax = nil;
 static id<MTLComputePipelineState> g_pipeline_attn_head = nil;
 static id<MTLComputePipelineState> g_pipeline_attn_layer = nil;
@@ -22,6 +24,11 @@ static id<MTLBuffer> g_matvec_vec_buf = nil;
 static id<MTLBuffer> g_matvec_out_buf = nil;
 static id<MTLBuffer> g_attn_q_buf = nil;
 static id<MTLBuffer> g_attn_out_buf = nil;
+static id<MTLBuffer> g_small_in_a_buf = nil;
+static id<MTLBuffer> g_small_in_b_buf = nil;
+static id<MTLBuffer> g_small_in_c_buf = nil;
+static id<MTLBuffer> g_small_out_a_buf = nil;
+static id<MTLBuffer> g_small_out_b_buf = nil;
 static dispatch_once_t g_init_once;
 static char *g_init_error = NULL;
 
@@ -120,6 +127,26 @@ static const char *shader_source =
     "    float rms = sqrt(ss / float(n) + eps);\n"
     "    out[gid] = (x[gid] / rms) * weight[gid];\n"
     "}\n"
+    "kernel void add_rms_norm_f32(\n"
+    "    const device float* a      [[buffer(0)]],\n"
+    "    const device float* b      [[buffer(1)]],\n"
+    "    const device float* weight [[buffer(2)]],\n"
+    "    device float* sum_out      [[buffer(3)]],\n"
+    "    device float* norm_out     [[buffer(4)]],\n"
+    "    constant uint& n           [[buffer(5)]],\n"
+    "    constant float& eps        [[buffer(6)]],\n"
+    "    uint gid                   [[thread_position_in_grid]]) {\n"
+    "    if (gid >= n) return;\n"
+    "    float ss = 0.0f;\n"
+    "    for (uint i = 0; i < n; ++i) {\n"
+    "        float v = a[i] + b[i];\n"
+    "        ss += v * v;\n"
+    "    }\n"
+    "    float rms = sqrt(ss / float(n) + eps);\n"
+    "    float x = a[gid] + b[gid];\n"
+    "    sum_out[gid] = x;\n"
+    "    norm_out[gid] = (x / rms) * weight[gid];\n"
+    "}\n"
     "kernel void apply_rope_f32(\n"
     "    const device float* input [[buffer(0)]],\n"
     "    device float* out         [[buffer(1)]],\n"
@@ -140,6 +167,46 @@ static const char *shader_source =
     "    float x1 = input[idx + 1u];\n"
     "    out[idx] = x0 * c - x1 * s;\n"
     "    out[idx + 1u] = x0 * s + x1 * c;\n"
+    "}\n"
+    "kernel void apply_rope_qk_f32(\n"
+    "    const device float* q_in   [[buffer(0)]],\n"
+    "    const device float* k_in   [[buffer(1)]],\n"
+    "    device float* q_out        [[buffer(2)]],\n"
+    "    device float* k_out        [[buffer(3)]],\n"
+    "    constant uint& q_len       [[buffer(4)]],\n"
+    "    constant uint& k_len       [[buffer(5)]],\n"
+    "    constant uint& pos         [[buffer(6)]],\n"
+    "    constant uint& head_dim    [[buffer(7)]],\n"
+    "    constant float& freq_base  [[buffer(8)]],\n"
+    "    uint gid                   [[thread_position_in_grid]]) {\n"
+    "    uint q_pairs = q_len / 2u;\n"
+    "    uint k_pairs = k_len / 2u;\n"
+    "    uint max_pairs = q_pairs > k_pairs ? q_pairs : k_pairs;\n"
+    "    if (gid >= max_pairs) return;\n"
+    "    if (gid < q_pairs) {\n"
+    "        uint idx = gid * 2u;\n"
+    "        uint i = idx % head_dim;\n"
+    "        float freq = pow(freq_base, -float(i) / float(head_dim));\n"
+    "        float theta = float(pos) * freq;\n"
+    "        float c = cos(theta);\n"
+    "        float s = sin(theta);\n"
+    "        float x0 = q_in[idx];\n"
+    "        float x1 = q_in[idx + 1u];\n"
+    "        q_out[idx] = x0 * c - x1 * s;\n"
+    "        q_out[idx + 1u] = x0 * s + x1 * c;\n"
+    "    }\n"
+    "    if (gid < k_pairs) {\n"
+    "        uint idx = gid * 2u;\n"
+    "        uint i = idx % head_dim;\n"
+    "        float freq = pow(freq_base, -float(i) / float(head_dim));\n"
+    "        float theta = float(pos) * freq;\n"
+    "        float c = cos(theta);\n"
+    "        float s = sin(theta);\n"
+    "        float x0 = k_in[idx];\n"
+    "        float x1 = k_in[idx + 1u];\n"
+    "        k_out[idx] = x0 * c - x1 * s;\n"
+    "        k_out[idx + 1u] = x0 * s + x1 * c;\n"
+    "    }\n"
     "}\n"
     "kernel void softmax_f32(\n"
     "    const device float* input [[buffer(0)]],\n"
@@ -300,12 +367,15 @@ static void init_metal_once(void) {
         id<MTLFunction> f16_fn = [lib newFunctionWithName:@"matvec_f16"];
         id<MTLFunction> q4_fn = [lib newFunctionWithName:@"matvec_q4_0"];
         id<MTLFunction> rms_fn = [lib newFunctionWithName:@"rms_norm_f32"];
+        id<MTLFunction> add_rms_fn = [lib newFunctionWithName:@"add_rms_norm_f32"];
         id<MTLFunction> rope_fn = [lib newFunctionWithName:@"apply_rope_f32"];
+        id<MTLFunction> rope_qk_fn = [lib newFunctionWithName:@"apply_rope_qk_f32"];
         id<MTLFunction> softmax_fn = [lib newFunctionWithName:@"softmax_f32"];
         id<MTLFunction> attn_fn = [lib newFunctionWithName:@"attn_head_f32"];
         id<MTLFunction> attn_layer_fn = [lib newFunctionWithName:@"attn_layer_f32"];
         if (f32_fn == nil || f16_fn == nil || q4_fn == nil || rms_fn == nil ||
-            rope_fn == nil || softmax_fn == nil || attn_fn == nil || attn_layer_fn == nil) {
+            add_rms_fn == nil || rope_fn == nil || rope_qk_fn == nil || softmax_fn == nil ||
+            attn_fn == nil || attn_layer_fn == nil) {
             set_init_error("failed to load required Metal functions from library");
             return;
         }
@@ -330,8 +400,18 @@ static void init_metal_once(void) {
             set_init_error(err.localizedDescription.UTF8String);
             return;
         }
+        g_pipeline_add_rms_norm = [g_device newComputePipelineStateWithFunction:add_rms_fn error:&err];
+        if (g_pipeline_add_rms_norm == nil) {
+            set_init_error(err.localizedDescription.UTF8String);
+            return;
+        }
         g_pipeline_apply_rope = [g_device newComputePipelineStateWithFunction:rope_fn error:&err];
         if (g_pipeline_apply_rope == nil) {
+            set_init_error(err.localizedDescription.UTF8String);
+            return;
+        }
+        g_pipeline_apply_rope_qk = [g_device newComputePipelineStateWithFunction:rope_qk_fn error:&err];
+        if (g_pipeline_apply_rope_qk == nil) {
             set_init_error(err.localizedDescription.UTF8String);
             return;
         }
@@ -491,18 +571,15 @@ static int run_rms_norm(
     }
 
     @autoreleasepool {
-        id<MTLBuffer> x_buf = [g_device newBufferWithBytes:x
-                                                    length:(NSUInteger)n * sizeof(float)
-                                                   options:MTLResourceStorageModeShared];
-        id<MTLBuffer> w_buf = [g_device newBufferWithBytes:weight
-                                                    length:(NSUInteger)n * sizeof(float)
-                                                   options:MTLResourceStorageModeShared];
-        id<MTLBuffer> out_buf = [g_device newBufferWithLength:(NSUInteger)n * sizeof(float)
-                                                      options:MTLResourceStorageModeShared];
+        NSUInteger n_bytes = (NSUInteger)n * sizeof(float);
+        id<MTLBuffer> x_buf = ensure_scratch_buffer(&g_small_in_a_buf, n_bytes, err);
+        id<MTLBuffer> w_buf = ensure_scratch_buffer(&g_small_in_b_buf, n_bytes, err);
+        id<MTLBuffer> out_buf = ensure_scratch_buffer(&g_small_out_a_buf, n_bytes, err);
         if (x_buf == nil || w_buf == nil || out_buf == nil) {
-            set_error(err, "failed to allocate Metal buffers for rms_norm");
             return 1;
         }
+        memcpy(x_buf.contents, x, n_bytes);
+        memcpy(w_buf.contents, weight, n_bytes);
 
         id<MTLCommandBuffer> cb = [g_queue commandBuffer];
         if (cb == nil) {
@@ -539,7 +616,82 @@ static int run_rms_norm(
             return 1;
         }
 
-        memcpy(out, out_buf.contents, (NSUInteger)n * sizeof(float));
+        memcpy(out, out_buf.contents, n_bytes);
+        return 0;
+    }
+}
+
+static int run_add_rms_norm(
+    const float *a,
+    const float *b,
+    const float *weight,
+    float *sum_out,
+    float *norm_out,
+    uint32_t n,
+    float eps,
+    char **err
+) {
+    if (a == NULL || b == NULL || weight == NULL || sum_out == NULL || norm_out == NULL) {
+        set_error(err, "null pointer input for add_rms_norm");
+        return 1;
+    }
+    if (n == 0) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        NSUInteger n_bytes = (NSUInteger)n * sizeof(float);
+        id<MTLBuffer> a_buf = ensure_scratch_buffer(&g_small_in_a_buf, n_bytes, err);
+        id<MTLBuffer> b_buf = ensure_scratch_buffer(&g_small_in_b_buf, n_bytes, err);
+        id<MTLBuffer> w_buf = ensure_scratch_buffer(&g_small_in_c_buf, n_bytes, err);
+        id<MTLBuffer> s_buf = ensure_scratch_buffer(&g_small_out_a_buf, n_bytes, err);
+        id<MTLBuffer> h_buf = ensure_scratch_buffer(&g_small_out_b_buf, n_bytes, err);
+        if (a_buf == nil || b_buf == nil || w_buf == nil || s_buf == nil || h_buf == nil) {
+            return 1;
+        }
+        memcpy(a_buf.contents, a, n_bytes);
+        memcpy(b_buf.contents, b, n_bytes);
+        memcpy(w_buf.contents, weight, n_bytes);
+
+        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+        if (cb == nil) {
+            set_error(err, "failed to create command buffer for add_rms_norm");
+            return 1;
+        }
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            set_error(err, "failed to create encoder for add_rms_norm");
+            return 1;
+        }
+
+        [enc setComputePipelineState:g_pipeline_add_rms_norm];
+        [enc setBuffer:a_buf offset:0 atIndex:0];
+        [enc setBuffer:b_buf offset:0 atIndex:1];
+        [enc setBuffer:w_buf offset:0 atIndex:2];
+        [enc setBuffer:s_buf offset:0 atIndex:3];
+        [enc setBuffer:h_buf offset:0 atIndex:4];
+        [enc setBytes:&n length:sizeof(uint32_t) atIndex:5];
+        [enc setBytes:&eps length:sizeof(float) atIndex:6];
+
+        NSUInteger thread_width = g_pipeline_add_rms_norm.threadExecutionWidth;
+        if (thread_width == 0) thread_width = 1;
+        NSUInteger tg_width = n < thread_width ? n : thread_width;
+        if (tg_width == 0) tg_width = 1;
+        MTLSize threads_per_tg = MTLSizeMake(tg_width, 1, 1);
+        MTLSize tg_count = MTLSizeMake(((NSUInteger)n + tg_width - 1) / tg_width, 1, 1);
+        [enc dispatchThreadgroups:tg_count threadsPerThreadgroup:threads_per_tg];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            const char *msg = cb.error.localizedDescription.UTF8String;
+            set_error(err, msg ? msg : "Metal add_rms_norm command failed");
+            return 1;
+        }
+
+        memcpy(sum_out, s_buf.contents, n_bytes);
+        memcpy(norm_out, h_buf.contents, n_bytes);
         return 0;
     }
 }
@@ -570,15 +722,13 @@ static int run_apply_rope(
     }
 
     @autoreleasepool {
-        id<MTLBuffer> in_buf = [g_device newBufferWithBytes:input
-                                                     length:(NSUInteger)len * sizeof(float)
-                                                    options:MTLResourceStorageModeShared];
-        id<MTLBuffer> out_buf = [g_device newBufferWithLength:(NSUInteger)len * sizeof(float)
-                                                      options:MTLResourceStorageModeShared];
+        NSUInteger len_bytes = (NSUInteger)len * sizeof(float);
+        id<MTLBuffer> in_buf = ensure_scratch_buffer(&g_small_in_a_buf, len_bytes, err);
+        id<MTLBuffer> out_buf = ensure_scratch_buffer(&g_small_out_a_buf, len_bytes, err);
         if (in_buf == nil || out_buf == nil) {
-            set_error(err, "failed to allocate Metal buffers for apply_rope");
             return 1;
         }
+        memcpy(in_buf.contents, input, len_bytes);
 
         id<MTLCommandBuffer> cb = [g_queue commandBuffer];
         if (cb == nil) {
@@ -617,7 +767,97 @@ static int run_apply_rope(
             return 1;
         }
 
-        memcpy(out, out_buf.contents, (NSUInteger)len * sizeof(float));
+        memcpy(out, out_buf.contents, len_bytes);
+        return 0;
+    }
+}
+
+static int run_apply_rope_qk(
+    const float *q_in,
+    const float *k_in,
+    float *q_out,
+    float *k_out,
+    uint32_t q_len,
+    uint32_t k_len,
+    uint32_t pos,
+    uint32_t head_dim,
+    float freq_base,
+    char **err
+) {
+    if (q_in == NULL || k_in == NULL || q_out == NULL || k_out == NULL) {
+        set_error(err, "null pointer input for apply_rope_qk");
+        return 1;
+    }
+    if (q_len == 0 || k_len == 0) {
+        return 0;
+    }
+    if (head_dim == 0 || (head_dim % 2u) != 0u) {
+        set_error(err, "apply_rope_qk requires non-zero even head_dim");
+        return 1;
+    }
+    if ((q_len % head_dim) != 0u || (k_len % head_dim) != 0u) {
+        set_error(err, "apply_rope_qk requires len % head_dim == 0");
+        return 1;
+    }
+
+    @autoreleasepool {
+        NSUInteger q_bytes = (NSUInteger)q_len * sizeof(float);
+        NSUInteger k_bytes = (NSUInteger)k_len * sizeof(float);
+        id<MTLBuffer> q_in_buf = ensure_scratch_buffer(&g_small_in_a_buf, q_bytes, err);
+        id<MTLBuffer> k_in_buf = ensure_scratch_buffer(&g_small_in_b_buf, k_bytes, err);
+        id<MTLBuffer> q_out_buf = ensure_scratch_buffer(&g_small_out_a_buf, q_bytes, err);
+        id<MTLBuffer> k_out_buf = ensure_scratch_buffer(&g_small_out_b_buf, k_bytes, err);
+        if (q_in_buf == nil || k_in_buf == nil || q_out_buf == nil || k_out_buf == nil) {
+            return 1;
+        }
+        memcpy(q_in_buf.contents, q_in, q_bytes);
+        memcpy(k_in_buf.contents, k_in, k_bytes);
+
+        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+        if (cb == nil) {
+            set_error(err, "failed to create command buffer for apply_rope_qk");
+            return 1;
+        }
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            set_error(err, "failed to create encoder for apply_rope_qk");
+            return 1;
+        }
+
+        [enc setComputePipelineState:g_pipeline_apply_rope_qk];
+        [enc setBuffer:q_in_buf offset:0 atIndex:0];
+        [enc setBuffer:k_in_buf offset:0 atIndex:1];
+        [enc setBuffer:q_out_buf offset:0 atIndex:2];
+        [enc setBuffer:k_out_buf offset:0 atIndex:3];
+        [enc setBytes:&q_len length:sizeof(uint32_t) atIndex:4];
+        [enc setBytes:&k_len length:sizeof(uint32_t) atIndex:5];
+        [enc setBytes:&pos length:sizeof(uint32_t) atIndex:6];
+        [enc setBytes:&head_dim length:sizeof(uint32_t) atIndex:7];
+        [enc setBytes:&freq_base length:sizeof(float) atIndex:8];
+
+        uint32_t q_pairs = q_len / 2u;
+        uint32_t k_pairs = k_len / 2u;
+        uint32_t max_pairs = q_pairs > k_pairs ? q_pairs : k_pairs;
+
+        NSUInteger thread_width = g_pipeline_apply_rope_qk.threadExecutionWidth;
+        if (thread_width == 0) thread_width = 1;
+        NSUInteger tg_width = max_pairs < thread_width ? max_pairs : thread_width;
+        if (tg_width == 0) tg_width = 1;
+        MTLSize threads_per_tg = MTLSizeMake(tg_width, 1, 1);
+        MTLSize tg_count = MTLSizeMake(((NSUInteger)max_pairs + tg_width - 1) / tg_width, 1, 1);
+        [enc dispatchThreadgroups:tg_count threadsPerThreadgroup:threads_per_tg];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            const char *msg = cb.error.localizedDescription.UTF8String;
+            set_error(err, msg ? msg : "Metal apply_rope_qk command failed");
+            return 1;
+        }
+
+        memcpy(q_out, q_out_buf.contents, q_bytes);
+        memcpy(k_out, k_out_buf.contents, k_bytes);
         return 0;
     }
 }
@@ -637,15 +877,13 @@ static int run_softmax(
     }
 
     @autoreleasepool {
-        id<MTLBuffer> in_buf = [g_device newBufferWithBytes:input
-                                                     length:(NSUInteger)n * sizeof(float)
-                                                    options:MTLResourceStorageModeShared];
-        id<MTLBuffer> out_buf = [g_device newBufferWithLength:(NSUInteger)n * sizeof(float)
-                                                      options:MTLResourceStorageModeShared];
+        NSUInteger n_bytes = (NSUInteger)n * sizeof(float);
+        id<MTLBuffer> in_buf = ensure_scratch_buffer(&g_small_in_a_buf, n_bytes, err);
+        id<MTLBuffer> out_buf = ensure_scratch_buffer(&g_small_out_a_buf, n_bytes, err);
         if (in_buf == nil || out_buf == nil) {
-            set_error(err, "failed to allocate Metal buffers for softmax");
             return 1;
         }
+        memcpy(in_buf.contents, input, n_bytes);
 
         id<MTLCommandBuffer> cb = [g_queue commandBuffer];
         if (cb == nil) {
@@ -676,7 +914,7 @@ static int run_softmax(
             return 1;
         }
 
-        memcpy(out, out_buf.contents, (NSUInteger)n * sizeof(float));
+        memcpy(out, out_buf.contents, n_bytes);
         return 0;
     }
 }
@@ -1038,6 +1276,26 @@ int rsllm_metal_rms_norm(
     return run_rms_norm(x, weight, out, n, eps, err);
 }
 
+int rsllm_metal_add_rms_norm(
+    const float *a,
+    const float *b,
+    const float *weight,
+    float *sum_out,
+    float *norm_out,
+    uint32_t n,
+    float eps,
+    char **err
+) {
+    dispatch_once(&g_init_once, ^{
+      init_metal_once();
+    });
+    if (g_init_error != NULL) {
+        set_error(err, g_init_error);
+        return 1;
+    }
+    return run_add_rms_norm(a, b, weight, sum_out, norm_out, n, eps, err);
+}
+
 int rsllm_metal_apply_rope(
     const float *input,
     float *out,
@@ -1055,6 +1313,39 @@ int rsllm_metal_apply_rope(
         return 1;
     }
     return run_apply_rope(input, out, len, pos, head_dim, freq_base, err);
+}
+
+int rsllm_metal_apply_rope_qk(
+    const float *q_in,
+    const float *k_in,
+    float *q_out,
+    float *k_out,
+    uint32_t q_len,
+    uint32_t k_len,
+    uint32_t pos,
+    uint32_t head_dim,
+    float freq_base,
+    char **err
+) {
+    dispatch_once(&g_init_once, ^{
+      init_metal_once();
+    });
+    if (g_init_error != NULL) {
+        set_error(err, g_init_error);
+        return 1;
+    }
+    return run_apply_rope_qk(
+        q_in,
+        k_in,
+        q_out,
+        k_out,
+        q_len,
+        k_len,
+        pos,
+        head_dim,
+        freq_base,
+        err
+    );
 }
 
 int rsllm_metal_softmax(

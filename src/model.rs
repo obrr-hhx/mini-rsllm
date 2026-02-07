@@ -265,10 +265,10 @@ impl<'a> LlamaModel<'a> {
             // 2c. Apply RoPE
             if use_gpu {
                 self.backend
-                    .rope(&mut q, &mut k, pos, head_dim, cfg.rope_freq_base);
+                    .rope_qk(&mut q, &mut k, pos, head_dim, cfg.rope_freq_base);
             } else {
                 self.cpu_backend
-                    .rope(&mut q, &mut k, pos, head_dim, cfg.rope_freq_base);
+                    .rope_qk(&mut q, &mut k, pos, head_dim, cfg.rope_freq_base);
             }
 
             // 2d. Store K, V into cache
@@ -316,11 +316,6 @@ impl<'a> LlamaModel<'a> {
             } else {
                 self.cpu_backend.matmul_vec(&layer.wo, &attn_out)
             };
-            x = if use_gpu {
-                self.backend.add(&x, &attn_proj)
-            } else {
-                self.cpu_backend.add(&x, &attn_proj)
-            };
 
             // 2g. FFN norm
             let ffn_norm_w = dequantize(
@@ -329,8 +324,13 @@ impl<'a> LlamaModel<'a> {
                 layer.ffn_norm.info.n_elements(),
             );
             let h = if use_gpu {
-                self.backend.rms_norm(&x, &ffn_norm_w, cfg.norm_eps)
+                let (x_new, h_new) =
+                    self.backend
+                        .add_rms_norm(&x, &attn_proj, &ffn_norm_w, cfg.norm_eps);
+                x = x_new;
+                h_new
             } else {
+                x = self.cpu_backend.add(&x, &attn_proj);
                 self.cpu_backend.rms_norm(&x, &ffn_norm_w, cfg.norm_eps)
             };
 

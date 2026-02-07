@@ -35,10 +35,32 @@ unsafe extern "C" {
         eps: f32,
         err: *mut *mut c_char,
     ) -> i32;
+    fn rsllm_metal_add_rms_norm(
+        a: *const f32,
+        b: *const f32,
+        weight: *const f32,
+        sum_out: *mut f32,
+        norm_out: *mut f32,
+        n: u32,
+        eps: f32,
+        err: *mut *mut c_char,
+    ) -> i32;
     fn rsllm_metal_apply_rope(
         input: *const f32,
         out: *mut f32,
         len: u32,
+        pos: u32,
+        head_dim: u32,
+        freq_base: f32,
+        err: *mut *mut c_char,
+    ) -> i32;
+    fn rsllm_metal_apply_rope_qk(
+        q_in: *const f32,
+        k_in: *const f32,
+        q_out: *mut f32,
+        k_out: *mut f32,
+        q_len: u32,
+        k_len: u32,
         pos: u32,
         head_dim: u32,
         freq_base: f32,
@@ -318,6 +340,58 @@ impl MetalContext {
         }
     }
 
+    pub fn add_rms_norm(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        weight: &[f32],
+        eps: f32,
+    ) -> Result<(Vec<f32>, Vec<f32>), String> {
+        if a.len() != b.len() || a.len() != weight.len() {
+            return Err(format!(
+                "add_rms_norm shape mismatch: a {}, b {}, weight {}",
+                a.len(),
+                b.len(),
+                weight.len()
+            ));
+        }
+        if a.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let mut sum_out = vec![0.0f32; a.len()];
+            let mut norm_out = vec![0.0f32; a.len()];
+            let mut err_ptr: *mut c_char = std::ptr::null_mut();
+            let status = unsafe {
+                rsllm_metal_add_rms_norm(
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    weight.as_ptr(),
+                    sum_out.as_mut_ptr(),
+                    norm_out.as_mut_ptr(),
+                    a.len() as u32,
+                    eps,
+                    &mut err_ptr,
+                )
+            };
+            if status == 0 {
+                Ok((sum_out, norm_out))
+            } else {
+                Err(take_error_message(err_ptr))
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = a;
+            let _ = b;
+            let _ = weight;
+            let _ = eps;
+            Err("Metal backend is only available on macOS".to_string())
+        }
+    }
+
     pub fn apply_rope(
         &self,
         data: &mut [f32],
@@ -367,6 +441,70 @@ impl MetalContext {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = data;
+            let _ = pos;
+            let _ = head_dim;
+            let _ = freq_base;
+            Err("Metal backend is only available on macOS".to_string())
+        }
+    }
+
+    pub fn apply_rope_qk(
+        &self,
+        q: &mut [f32],
+        k: &mut [f32],
+        pos: usize,
+        head_dim: usize,
+        freq_base: f32,
+    ) -> Result<(), String> {
+        if q.is_empty() || k.is_empty() {
+            return Ok(());
+        }
+        if head_dim == 0 || head_dim % 2 != 0 {
+            return Err(format!(
+                "apply_rope_qk requires non-zero even head_dim, got {}",
+                head_dim
+            ));
+        }
+        if q.len() % head_dim != 0 || k.len() % head_dim != 0 {
+            return Err(format!(
+                "apply_rope_qk requires len % head_dim == 0, got q {} and k {} with head_dim {}",
+                q.len(),
+                k.len(),
+                head_dim
+            ));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let mut q_out = vec![0.0f32; q.len()];
+            let mut k_out = vec![0.0f32; k.len()];
+            let mut err_ptr: *mut c_char = std::ptr::null_mut();
+            let status = unsafe {
+                rsllm_metal_apply_rope_qk(
+                    q.as_ptr(),
+                    k.as_ptr(),
+                    q_out.as_mut_ptr(),
+                    k_out.as_mut_ptr(),
+                    q.len() as u32,
+                    k.len() as u32,
+                    pos as u32,
+                    head_dim as u32,
+                    freq_base,
+                    &mut err_ptr,
+                )
+            };
+            if status == 0 {
+                q.copy_from_slice(&q_out);
+                k.copy_from_slice(&k_out);
+                Ok(())
+            } else {
+                Err(take_error_message(err_ptr))
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = q;
+            let _ = k;
             let _ = pos;
             let _ = head_dim;
             let _ = freq_base;
@@ -763,6 +901,40 @@ mod tests {
     }
 
     #[test]
+    fn add_rms_norm_matches_cpu() {
+        let ctx = match MetalContext::new(0) {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        let a = vec![1.0f32, -2.0f32, 0.5f32, 4.0f32, -1.25f32, 0.25f32];
+        let b = vec![-0.5f32, 0.75f32, 1.5f32, -0.25f32, 0.5f32, -1.0f32];
+        let w = vec![1.1f32, 0.9f32, 1.0f32, 0.8f32, 1.2f32, 0.7f32];
+        let eps = 1e-5f32;
+
+        let (sum_gpu, norm_gpu) = ctx.add_rms_norm(&a, &b, &w, eps).unwrap();
+        let sum_cpu = tensor::add(&a, &b);
+        let norm_cpu = tensor::rms_norm(&sum_cpu, &w, eps);
+
+        for i in 0..a.len() {
+            assert!(
+                (sum_gpu[i] - sum_cpu[i]).abs() < 1e-6,
+                "sum idx {} mismatch: gpu={}, cpu={}",
+                i,
+                sum_gpu[i],
+                sum_cpu[i]
+            );
+            assert!(
+                (norm_gpu[i] - norm_cpu[i]).abs() < 1e-5,
+                "norm idx {} mismatch: gpu={}, cpu={}",
+                i,
+                norm_gpu[i],
+                norm_cpu[i]
+            );
+        }
+    }
+
+    #[test]
     fn rope_matches_cpu() {
         let ctx = match MetalContext::new(0) {
             Ok(ctx) => ctx,
@@ -786,6 +958,50 @@ mod tests {
         ctx.apply_rope(&mut q_gpu, pos, head_dim, freq_base)
             .unwrap();
         ctx.apply_rope(&mut k_gpu, pos, head_dim, freq_base)
+            .unwrap();
+
+        for i in 0..q_gpu.len() {
+            assert!(
+                (q_gpu[i] - q_cpu[i]).abs() < 1e-5,
+                "q idx {} mismatch: gpu={}, cpu={}",
+                i,
+                q_gpu[i],
+                q_cpu[i]
+            );
+        }
+        for i in 0..k_gpu.len() {
+            assert!(
+                (k_gpu[i] - k_cpu[i]).abs() < 1e-5,
+                "k idx {} mismatch: gpu={}, cpu={}",
+                i,
+                k_gpu[i],
+                k_cpu[i]
+            );
+        }
+    }
+
+    #[test]
+    fn rope_qk_fused_matches_cpu() {
+        let ctx = match MetalContext::new(0) {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        let pos = 11usize;
+        let head_dim = 4usize;
+        let freq_base = 10000.0f32;
+
+        let mut q_cpu = vec![
+            0.2f32, -0.1f32, 0.4f32, 0.5f32, -0.3f32, 0.7f32, 0.8f32, -0.2f32,
+        ];
+        let mut k_cpu = vec![0.15f32, 0.25f32, -0.35f32, 0.45f32];
+        tensor::rope(&mut q_cpu, &mut k_cpu, pos, head_dim, freq_base);
+
+        let mut q_gpu = vec![
+            0.2f32, -0.1f32, 0.4f32, 0.5f32, -0.3f32, 0.7f32, 0.8f32, -0.2f32,
+        ];
+        let mut k_gpu = vec![0.15f32, 0.25f32, -0.35f32, 0.45f32];
+        ctx.apply_rope_qk(&mut q_gpu, &mut k_gpu, pos, head_dim, freq_base)
             .unwrap();
 
         for i in 0..q_gpu.len() {

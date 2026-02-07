@@ -42,9 +42,17 @@ pub trait Backend: Send + Sync {
     fn matmul_vec(&self, mat: &TensorRef, vec: &[f32]) -> Vec<f32>;
     fn rms_norm(&self, x: &[f32], weight: &[f32], eps: f32) -> Vec<f32>;
     fn rope(&self, q: &mut [f32], k: &mut [f32], pos: usize, head_dim: usize, freq_base: f32);
+    fn rope_qk(&self, q: &mut [f32], k: &mut [f32], pos: usize, head_dim: usize, freq_base: f32) {
+        self.rope(q, k, pos, head_dim, freq_base);
+    }
     fn softmax(&self, x: &mut [f32]);
     fn silu(&self, x: &[f32]) -> Vec<f32>;
     fn add(&self, a: &[f32], b: &[f32]) -> Vec<f32>;
+    fn add_rms_norm(&self, a: &[f32], b: &[f32], weight: &[f32], eps: f32) -> (Vec<f32>, Vec<f32>) {
+        let sum = self.add(a, b);
+        let norm = self.rms_norm(&sum, weight, eps);
+        (sum, norm)
+    }
     fn mul(&self, a: &[f32], b: &[f32]) -> Vec<f32>;
     fn store_kv(&self, _layer_idx: usize, _pos: usize, _k: &[f32], _v: &[f32], _kv_dim: usize) {}
     fn attention_head(
@@ -155,6 +163,10 @@ impl Backend for CpuBackend {
         tensor::rope(q, k, pos, head_dim, freq_base);
     }
 
+    fn rope_qk(&self, q: &mut [f32], k: &mut [f32], pos: usize, head_dim: usize, freq_base: f32) {
+        tensor::rope(q, k, pos, head_dim, freq_base);
+    }
+
     fn softmax(&self, x: &mut [f32]) {
         tensor::softmax(x);
     }
@@ -165,6 +177,12 @@ impl Backend for CpuBackend {
 
     fn add(&self, a: &[f32], b: &[f32]) -> Vec<f32> {
         tensor::add(a, b)
+    }
+
+    fn add_rms_norm(&self, a: &[f32], b: &[f32], weight: &[f32], eps: f32) -> (Vec<f32>, Vec<f32>) {
+        let sum = tensor::add(a, b);
+        let norm = tensor::rms_norm(&sum, weight, eps);
+        (sum, norm)
     }
 
     fn mul(&self, a: &[f32], b: &[f32]) -> Vec<f32> {
@@ -256,6 +274,25 @@ impl Backend for MetalBackend {
         }
     }
 
+    fn rope_qk(&self, q: &mut [f32], k: &mut [f32], pos: usize, head_dim: usize, freq_base: f32) {
+        if self.gpu_layers == 0 {
+            self.cpu_fallback.rope_qk(q, k, pos, head_dim, freq_base);
+            return;
+        }
+
+        let q_orig = q.to_vec();
+        let k_orig = k.to_vec();
+        let ok = self
+            .context
+            .apply_rope_qk(q, k, pos, head_dim, freq_base)
+            .is_ok();
+        if !ok {
+            q.copy_from_slice(&q_orig);
+            k.copy_from_slice(&k_orig);
+            self.cpu_fallback.rope_qk(q, k, pos, head_dim, freq_base);
+        }
+    }
+
     fn softmax(&self, x: &mut [f32]) {
         if self.gpu_layers == 0 || self.context.softmax(x).is_err() {
             self.cpu_fallback.softmax(x);
@@ -268,6 +305,17 @@ impl Backend for MetalBackend {
 
     fn add(&self, a: &[f32], b: &[f32]) -> Vec<f32> {
         self.cpu_fallback.add(a, b)
+    }
+
+    fn add_rms_norm(&self, a: &[f32], b: &[f32], weight: &[f32], eps: f32) -> (Vec<f32>, Vec<f32>) {
+        if self.gpu_layers == 0 {
+            return self.cpu_fallback.add_rms_norm(a, b, weight, eps);
+        }
+
+        match self.context.add_rms_norm(a, b, weight, eps) {
+            Ok(out) => out,
+            Err(_) => self.cpu_fallback.add_rms_norm(a, b, weight, eps),
+        }
     }
 
     fn mul(&self, a: &[f32], b: &[f32]) -> Vec<f32> {
